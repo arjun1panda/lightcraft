@@ -163,6 +163,111 @@ fn a_failed_or_corrupt_copy_keeps_the_source() {
     }
 }
 
+/// Issue #96: Import → Copy used a plain unverified copy (and check-then-copy naming that could
+/// replace a file). It now gets the same verified copy as Move: a copy that fails or comes out
+/// different is removed and reported as a failed import, nothing is catalogued, and the card
+/// is untouched; a good copy never replaces an existing file.
+#[test]
+fn copy_import_verifies_each_copy() {
+    let import_copy = |s: &mut Session, card: &Path, dest: &Path| {
+        s.execute(
+            "library.import",
+            &json!({"paths": [card.to_string_lossy()], "mode": "copy", "destination": dest.to_string_lossy(), "organize": "flat"}),
+        )
+        .unwrap()
+    };
+    for fault in [Fault::FailWrite, Fault::Corrupt] {
+        let base = temp_dir(&format!("copyfail-{fault:?}"));
+        let (card, dest) = (base.join("card"), base.join("out"));
+        write_png(&card.join("a.png"), 3);
+        let bytes = std::fs::read(card.join("a.png")).unwrap();
+        let mut s = session();
+        inject(fault);
+        let r = import_copy(&mut s, &card, &dest);
+        inject(Fault::None);
+        assert_eq!(len(&r, "failed"), 1, "{fault:?}: {r}");
+        assert_eq!(len(&r, "imported"), 0, "{fault:?}: {r}");
+        assert!(r.to_string().contains("the original is untouched"), "{r}");
+        assert_eq!(s.catalog.len(), 0);
+        assert_eq!(std::fs::read(card.join("a.png")).unwrap(), bytes, "{fault:?}: source intact");
+        assert_eq!(files_under(&dest), Vec::<String>::new(), "{fault:?}: no bad copy left");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    // a good copy: verified, and a taken name gets -1 instead of being replaced
+    let base = temp_dir("copyok");
+    let (card, dest) = (base.join("card"), base.join("out"));
+    write_png(&card.join("a.png"), 4);
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("a.png"), b"someone else's file").unwrap();
+    let mut s = session();
+    let r = import_copy(&mut s, &card, &dest);
+    assert_eq!(len(&r, "imported"), 1, "{r}");
+    assert_eq!(std::fs::read(dest.join("a.png")).unwrap(), b"someone else's file");
+    assert_eq!(std::fs::read(dest.join("a-1.png")).unwrap(), std::fs::read(card.join("a.png")).unwrap());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Copy verifies against the probe's content hash (issue #134): the hash, not a re-read of the
+/// source, is the reference — a copy that matches the source but not the hash is refused, a
+/// corrupted copy is caught, and the file hash agrees with `hash_bytes` across read chunks.
+#[test]
+fn copy_is_verified_against_the_probe_hash() {
+    use crate::import_move::copy_verified;
+    let base = temp_dir("copyhash");
+    let src = base.join("src.bin");
+    // larger than one 1 MB read, not a multiple of it
+    let bytes: Vec<u8> = (0..(3 << 20) + 12_345u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    std::fs::write(&src, &bytes).unwrap();
+    let good = lightcraft_preview::hash_bytes(&bytes);
+    copy_verified(&src, &base.join("ok.bin"), Some(good)).unwrap();
+    assert_eq!(std::fs::read(base.join("ok.bin")).unwrap(), bytes);
+    // a hash that doesn't match: refused (a byte compare with the source would have passed)
+    let stale = lightcraft_preview::hash_bytes(b"what the probe read earlier");
+    let e = copy_verified(&src, &base.join("stale.bin"), Some(stale)).unwrap_err();
+    assert!(e.to_string().contains("differs"), "{e}");
+    assert!(!base.join("stale.bin").exists(), "the refused copy is removed");
+    // a copy that comes out different: caught by the hash
+    inject(Fault::Corrupt);
+    let r = copy_verified(&src, &base.join("bad.bin"), Some(good));
+    inject(Fault::None);
+    assert!(r.is_err());
+    assert!(!base.join("bad.bin").exists());
+    assert_eq!(std::fs::read(&src).unwrap(), bytes, "the source is untouched");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A file replaced after Review Import probed it is not imported on the strength of the old probe:
+/// its copy no longer matches the probe's hash, so it's reported as failed and nothing is left.
+#[test]
+fn copy_import_refuses_a_file_changed_since_the_review() {
+    let base = temp_dir("copychanged");
+    let (card, dest) = (base.join("card"), base.join("out"));
+    write_png(&card.join("a.png"), 3);
+    let mut s = session();
+    let r = s.execute("library.importPreview", &json!({"paths": [card.to_string_lossy()]})).unwrap();
+    assert_eq!(r["scanned"], 1, "{r}");
+    write_png(&card.join("a.png"), 9); // other pixels
+    let r = s
+        .execute(
+            "library.import",
+            &json!({"paths": [card.to_string_lossy()], "mode": "copy", "destination": dest.to_string_lossy(), "organize": "flat"}),
+        )
+        .unwrap();
+    assert_eq!(len(&r, "imported"), 0, "{r}");
+    assert_eq!(len(&r, "failed"), 1, "{r}");
+    assert!(r.to_string().contains("changed meanwhile"), "{r}");
+    assert_eq!(files_under(&dest), Vec::<String>::new());
+    // importing again probes afresh and succeeds
+    let r = s
+        .execute(
+            "library.import",
+            &json!({"paths": [card.to_string_lossy()], "mode": "copy", "destination": dest.to_string_lossy(), "organize": "flat"}),
+        )
+        .unwrap();
+    assert_eq!(len(&r, "imported"), 1, "{r}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A source that can't be removed (a read-only card) stays and is reported; the photo is
 /// imported from its copy.
 #[test]
@@ -274,5 +379,124 @@ fn move_into_the_library_is_saved_before_sources_go() {
     let mut again = Session::new().with_fs();
     again.open_library(&lib, false).unwrap();
     assert_eq!(photo_paths(&again), [want.to_string_lossy()]);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Timing for issue #134 (not a pass/fail test): `cargo test -p lightcraft-engine --release
+/// write_policy_timing -- --ignored --nocapture`. Writes N export-sized files durably (temp +
+/// sync + rename) and atomically only, and copies N files verified byte for byte and against the
+/// probe hash, alternating so a loaded machine affects both alike. `LIGHTCRAFT_BENCH_DIR` puts
+/// the files on another volume (a USB drive or a NAS is where the difference shows).
+#[test]
+#[ignore]
+fn write_policy_timing() {
+    use crate::import_move::copy_verified;
+    use lightcraft_catalog::safe_file::{write_atomic, write_atomic_nosync};
+    use std::time::{Duration, Instant};
+    let root = std::env::var_os("LIGHTCRAFT_BENCH_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = root.join(format!("lc-write-policy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let data = |n: usize, seed: u32| -> Vec<u8> { (0..n as u32).map(|i| (i.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 11) as u8).collect() };
+    let (n, size) = (200usize, 300 << 10);
+    let (mut synced, mut unsynced) = (Duration::ZERO, Duration::ZERO);
+    for i in 0..n {
+        let b = data(size, i as u32);
+        let t = Instant::now();
+        write_atomic(&base.join(format!("sync-{i}.jpg")), &b).unwrap();
+        synced += t.elapsed();
+        let t = Instant::now();
+        write_atomic_nosync(&base.join(format!("nosync-{i}.jpg")), &b).unwrap();
+        unsynced += t.elapsed();
+    }
+    println!("export {n} × {} KB: write_atomic (synced) {synced:?}, write_atomic_nosync {unsynced:?}", size >> 10);
+    let (n, size) = (40usize, 8 << 20);
+    let card = base.join("card");
+    std::fs::create_dir_all(&card).unwrap();
+    let hashes: Vec<_> = (0..n)
+        .map(|i| {
+            let b = data(size, 7 * i as u32);
+            std::fs::write(card.join(format!("{i}.raw")), &b).unwrap();
+            lightcraft_preview::hash_bytes(&b)
+        })
+        .collect();
+    let (mut bytewise, mut hashed) = (Duration::ZERO, Duration::ZERO);
+    for (i, h) in hashes.iter().enumerate() {
+        let src = card.join(format!("{i}.raw"));
+        let t = Instant::now();
+        copy_verified(&src, &base.join(format!("bytes-{i}.raw")), None).unwrap();
+        bytewise += t.elapsed();
+        let t = Instant::now();
+        copy_verified(&src, &base.join(format!("hash-{i}.raw")), Some(*h)).unwrap();
+        hashed += t.elapsed();
+    }
+    println!("copy {n} × {} MB: byte compare with the source {bytewise:?}, probe hash {hashed:?}", size >> 20);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Issue #367: Import → Copy wrote and verified one file after another on one thread. The copies
+/// now run side by side, with the names, order, duplicates and reports a one-by-one copy gives:
+/// like-named files take -1, -2… in file order (also against a file already there and a literal
+/// `IMG_1-1`), and a file with the content of one copied earlier in the batch is its duplicate
+/// (also while that copy is still under way).
+#[test]
+fn copies_run_side_by_side_with_the_same_outcome() {
+    let base = temp_dir("parallel-copy");
+    let (card, dest) = (base.join("card"), base.join("out"));
+    write_png(&card.join("a/IMG_1.png"), 1);
+    write_png(&card.join("a/IMG_2.png"), 2);
+    write_png(&card.join("b/IMG_1.png"), 3);
+    write_png(&card.join("b/IMG_1-1.png"), 4);
+    write_png(&card.join("c/IMG_1.png"), 5);
+    for i in 0..8u8 {
+        write_png(&card.join(format!("d/p{i}.png")), 10 + i);
+    }
+    // the content of a file whose copy is still under way
+    std::fs::create_dir_all(card.join("e")).unwrap();
+    std::fs::copy(card.join("d/p3.png"), card.join("e/dup.png")).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("IMG_2.png"), b"someone else's file").unwrap();
+
+    let mut s = session();
+    inject(Fault::Slow);
+    let r = s
+        .execute(
+            "library.import",
+            &json!({"paths": [card.to_string_lossy()], "mode": "copy", "destination": dest.to_string_lossy(), "organize": "flat"}),
+        )
+        .unwrap();
+    inject(Fault::None);
+    let threads: std::collections::HashSet<_> = crate::import_move::copy_threads().into_iter().collect();
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) > 1 {
+        assert!(threads.len() > 1, "copies ran on {} thread(s)", threads.len());
+    }
+
+    assert_eq!(len(&r, "imported"), 13, "{r}");
+    assert_eq!(len(&r, "failed"), 0, "{r}");
+    assert_eq!(len(&r, "duplicates"), 1, "{r}");
+    assert_eq!(r["duplicates"][0]["reason"], "content");
+    assert!(r["duplicates"][0]["path"].as_str().unwrap().ends_with("dup.png"), "{r}");
+    // the order of a one-by-one copy (files in name order), each verified
+    let expect = [
+        ("a/IMG_1.png", "IMG_1.png"),
+        ("a/IMG_2.png", "IMG_2-1.png"),
+        ("b/IMG_1-1.png", "IMG_1-1.png"),
+        ("b/IMG_1.png", "IMG_1-2.png"),
+        ("c/IMG_1.png", "IMG_1-3.png"),
+    ];
+    for (src, dst) in expect {
+        assert_eq!(std::fs::read(dest.join(dst)).unwrap(), std::fs::read(card.join(src)).unwrap(), "{src} → {dst}");
+    }
+    for i in 0..8 {
+        assert_eq!(std::fs::read(dest.join(format!("p{i}.png"))).unwrap(), std::fs::read(card.join(format!("d/p{i}.png"))).unwrap());
+    }
+    assert_eq!(std::fs::read(dest.join("IMG_2.png")).unwrap(), b"someone else's file");
+    assert_eq!(files_under(&dest).len(), 14, "{:?}", files_under(&dest));
+    // the duplicate names the photo copied from the same content (d/p3); ids follow the file order
+    let ids: Vec<u64> = r["imported"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+    assert_eq!(r["duplicates"][0]["existing"], ids[8], "{r}");
+    let first = s.catalog.photo(lightcraft_catalog::PhotoId(ids[0])).unwrap();
+    assert_eq!(first.file_name, "IMG_1.png");
     let _ = std::fs::remove_dir_all(&base);
 }

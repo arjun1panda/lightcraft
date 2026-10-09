@@ -173,16 +173,177 @@ fn foreign_crs_sidecar_on_import_and_read_from_file() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
+const MWG_REGIONS: &str = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#">
+   <mwg-rs:Regions>
+    <rdf:Description>
+     <mwg-rs:AppliedToDimensions stDim:w="100" stDim:h="100" stDim:unit="pixel"/>
+     <mwg-rs:RegionList>
+      <rdf:Bag>
+       <rdf:li>
+        <rdf:Description mwg-rs:Name="Jane Doe" mwg-rs:Type="Face">
+         <mwg-rs:Area stArea:x="0.5" stArea:y="0.5" stArea:w="0.3" stArea:h="0.4" stArea:unit="normalized"/>
+        </rdf:Description>
+       </rdf:li>
+      </rdf:Bag>
+     </mwg-rs:RegionList>
+    </rdf:Description>
+   </mwg-rs:Regions>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+/// A face region written by Lightroom (MWG-RS) into a sidecar reaches `Photo.meta.regions` on
+/// import — the same path real catalogs use, exercised end to end rather than just at the parser.
+#[test]
+fn regions_from_sidecar_are_read_on_import() {
+    let src = temp_dir("regions");
+    write_png(&src.join("portrait.png"), 9);
+    std::fs::write(src.join("portrait.xmp"), MWG_REGIONS).unwrap();
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(r["sidecars"], 1);
+    let p = s.catalog.photos().next().unwrap().clone();
+    assert_eq!(p.meta.regions.len(), 1);
+    let region = &p.meta.regions[0];
+    assert_eq!(region.name.as_deref(), Some("Jane Doe"));
+    assert_eq!(region.kind, lightcraft_meta::RegionKind::Face);
+    assert!((region.rect.width() - 0.3).abs() < 1e-9, "{:?}", region.rect);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Removing a face box is a catalog-only, undoable edit: it never rewrites the sidecar (Lightroom's
+/// regions and everything else in it stay byte for byte), even with auto-write on.
+#[test]
+fn removing_a_region_is_undoable_and_leaves_the_sidecar_alone() {
+    let src = temp_dir("region-remove");
+    write_png(&src.join("portrait.png"), 9);
+    std::fs::write(src.join("portrait.xmp"), MWG_REGIONS).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = s.active().unwrap();
+    s.execute("library.xmpPreferences", &json!({"autoWrite": true})).unwrap();
+    let before = std::fs::read(src.join("portrait.xmp")).unwrap();
+    let n = s.catalog.photo(id).unwrap().meta.regions.len();
+    assert!(n >= 1);
+    assert!(s.execute("photo.removeRegion", &json!({"index": n})).is_err(), "out of range");
+    assert!(s.execute("photo.removeRegion", &json!({})).is_err(), "no index");
+    let r = s.execute("photo.removeRegion", &json!({"index": 0})).unwrap();
+    assert_eq!(r["removed"], "Jane Doe");
+    assert_eq!(s.catalog.photo(id).unwrap().meta.regions.len(), n - 1);
+    assert_eq!(std::fs::read(src.join("portrait.xmp")).unwrap(), before, "the sidecar is untouched");
+    // an ordinary edit still auto-writes (the guard is per command)
+    s.execute("photo.rate", &json!({"rating": 4})).unwrap();
+    assert_ne!(std::fs::read(src.join("portrait.xmp")).unwrap(), before, "auto-write still works for other edits");
+    // undo brings the region back
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().meta.regions.len(), n);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Resizing a face box is a catalog-only, undoable edit with strict input handling; it leaves the
+/// sidecar alone like removal does.
+#[test]
+fn resizing_a_region_validates_clamps_undoes_and_leaves_the_sidecar_alone() {
+    let src = temp_dir("region-resize");
+    write_png(&src.join("portrait.png"), 9);
+    std::fs::write(src.join("portrait.xmp"), MWG_REGIONS).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = s.active().unwrap();
+    s.execute("library.xmpPreferences", &json!({"autoWrite": true})).unwrap();
+    let before = std::fs::read(src.join("portrait.xmp")).unwrap();
+    let original = s.catalog.photo(id).unwrap().meta.regions[0].rect;
+    let set = |s: &mut Session, rect: serde_json::Value| s.execute("photo.setRegion", &json!({"index": 0, "rect": rect}));
+    // hostile input is an error and changes nothing
+    for bad in [
+        json!({"x0": 0.1, "y0": 0.1, "x1": 0.1, "y1": 0.5}),
+        json!({"x0": 0.1, "y0": 0.1, "x1": 0.1001, "y1": 0.5}),
+        json!({"x0": 0.1, "y0": 0.1, "x1": 0.5}),
+        json!({"x0": "a", "y0": 0.1, "x1": 0.5, "y1": 0.5}),
+        json!({"x0": null, "y0": 0.1, "x1": 0.5, "y1": 0.5}),
+    ] {
+        assert!(set(&mut s, bad.clone()).is_err(), "{bad}");
+    }
+    assert!(s.execute("photo.setRegion", &json!({"index": 9, "rect": {"x0": 0.1, "y0": 0.1, "x1": 0.5, "y1": 0.5}})).is_err(), "no such region");
+    assert!(s.execute("photo.setRegion", &json!({"index": 0})).is_err(), "no rect");
+    assert_eq!(s.catalog.photo(id).unwrap().meta.regions[0].rect, original);
+    // corners given in any order and outside the photo are clamped into it
+    let r = set(&mut s, json!({"x0": 0.6, "y0": 1.5, "x1": -0.2, "y1": 0.2})).unwrap();
+    assert_eq!(r["rect"], json!({"x0": 0.0, "y0": 0.2, "x1": 0.6, "y1": 1.0}));
+    let now = s.catalog.photo(id).unwrap().meta.regions[0].rect;
+    assert_eq!((now.x0, now.y0, now.x1, now.y1), (0.0, 0.2, 0.6, 1.0));
+    assert_eq!(std::fs::read(src.join("portrait.xmp")).unwrap(), before, "the sidecar is untouched");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().meta.regions[0].rect, original);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Re-reading a sidecar: one that has `mwg-rs:Regions` is authoritative, so an emptied region list
+/// clears the stale regions; one without `mwg-rs:Regions` (an app that doesn't do regions) leaves the
+/// photo's regions alone.
+#[test]
+fn rereading_a_sidecar_clears_regions_only_when_it_states_them() {
+    let src = temp_dir("region-reread");
+    write_png(&src.join("portrait.png"), 9);
+    std::fs::write(src.join("portrait.xmp"), MWG_REGIONS).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = s.active().unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().meta.regions.len(), 1);
+    // another app rewrote the sidecar without any notion of regions: they stay
+    std::fs::write(
+        src.join("portrait.xmp"),
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="3"/>
+</rdf:RDF></x:xmpmeta>"#,
+    )
+    .unwrap();
+    s.execute("photo.readMetadataFromFile", &json!({})).unwrap();
+    let p = s.catalog.photo(id).unwrap();
+    assert_eq!(p.rating, 3, "the sidecar was read");
+    assert_eq!(p.meta.regions.len(), 1, "a sidecar without mwg-rs:Regions keeps the photo's regions");
+    // a region-aware app removed every region: the sidecar says so, and the catalog follows
+    let emptied = MWG_REGIONS.replace(
+        r#"<rdf:li>
+        <rdf:Description mwg-rs:Name="Jane Doe" mwg-rs:Type="Face">
+         <mwg-rs:Area stArea:x="0.5" stArea:y="0.5" stArea:w="0.3" stArea:h="0.4" stArea:unit="normalized"/>
+        </rdf:Description>
+       </rdf:li>"#,
+        "",
+    );
+    assert_ne!(emptied, MWG_REGIONS);
+    std::fs::write(src.join("portrait.xmp"), emptied).unwrap();
+    s.execute("photo.readMetadataFromFile", &json!({})).unwrap();
+    assert!(s.catalog.photo(id).unwrap().meta.regions.is_empty(), "an emptied region list clears stale regions");
+    // undo brings them back
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().meta.regions.len(), 1);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
 fn synthetic_dng(xmp: &str) -> Vec<u8> {
     synthetic_dng_with(Some(xmp), lightcraft_meta::Metadata::default())
 }
 
 /// A tiny Bayer DNG written by our own DNG writer (optional embedded XMP, camera metadata).
 pub(crate) fn synthetic_dng_with(xmp: Option<&str>, metadata: lightcraft_meta::Metadata) -> Vec<u8> {
-    use lightcraft_raw::*;
     let (w, h) = (32usize, 24usize);
-    let cfa = Cfa::bayer("RGGB").unwrap();
     let data: Vec<u16> = (0..w * h).map(|i| 256 + ((i % w) * 300 + (i / w) * 200) as u16).collect();
+    synthetic_dng_of(w, h, "RGGB", data, xmp, metadata)
+}
+
+/// A synthetic Bayer DNG for denoise and cache tests.
+pub(crate) fn synthetic_dng_of(w: usize, h: usize, cfa: &str, data: Vec<u16>, xmp: Option<&str>, metadata: lightcraft_meta::Metadata) -> Vec<u8> {
+    use lightcraft_raw::*;
+    let cfa = Cfa::bayer(cfa).unwrap();
     let raw = RawImage {
         format: RawFormat::Dng,
         width: w,
@@ -326,6 +487,55 @@ fn convert_raw_to_dng() {
     assert!(card.join("DSC_1.NEF").exists(), "the card is untouched");
     let id2 = lightcraft_catalog::PhotoId(r["imported"][0].as_u64().unwrap());
     assert_eq!(s.catalog.photo(id2).unwrap().format, "DNG");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #106: Convert to DNG wrote straight to the final name (no temp file, sync or check) and
+/// relinked the photo even when the write was cut short. A failed write now leaves no DNG and
+/// the photo on its raw; a good one is verified and never replaces an existing file.
+#[test]
+fn convert_to_dng_is_verified_and_atomic() {
+    let dir = temp_dir("todng-safe");
+    // a synthetic raw (stored as DNG, catalogued as a NEF so Convert to DNG takes it)
+    let raw = dir.join("shot.dng");
+    let bytes = synthetic_dng_with(None, Default::default());
+    std::fs::write(&raw, &bytes).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [raw.to_string_lossy()]})).unwrap();
+    let id = s.catalog.photos().next().unwrap().id;
+    let path = raw.to_string_lossy().to_string();
+    s.catalog
+        .apply(lightcraft_catalog::Op::Relink {
+            id,
+            file_name: "shot.dng".into(),
+            source: lightcraft_catalog::Source::File { path: path.clone() },
+            format: Some("NEF".into()),
+        })
+        .unwrap();
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    let names = || {
+        let mut v: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    };
+    {
+        // the drive fills up part-way
+        let _fault = lightcraft_catalog::safe_file::fail_writes_after(200);
+        let r = s.execute("photo.convertToDng", &json!({})).unwrap();
+        assert_eq!(r["converted"].as_array().unwrap().len(), 0, "{r}");
+        assert!(r["skipped"][0][1].as_str().unwrap().contains("the raw is kept"), "{r}");
+    }
+    assert_eq!(names(), ["shot.dng"], "no partial DNG");
+    assert_eq!(s.catalog.photo(id).unwrap().source, lightcraft_catalog::Source::File { path: path.clone() }, "not relinked");
+    // a good conversion: a new name (the existing file is not replaced), decodable, relinked
+    let r = s.execute("photo.convertToDng", &json!({})).unwrap();
+    let out = r["converted"][0]["path"].as_str().unwrap().to_string();
+    assert!(out.ends_with("shot-2.dng"), "{r}");
+    assert_eq!(std::fs::read(&raw).unwrap(), bytes, "the raw is untouched");
+    let back = lightcraft_raw::decode(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(back.data, lightcraft_raw::decode(&bytes).unwrap().data);
+    assert_eq!(s.catalog.photo(id).unwrap().source, lightcraft_catalog::Source::File { path: out });
+    assert_eq!(names(), ["shot-2.dng", "shot.dng"], "no temp file left");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -573,6 +783,135 @@ fn copyright_status_usage_terms_and_url_round_trip() {
         (expect_a.copyright.as_str(), CopyrightStatus::Copyrighted, "Editorial use only", "https://example.com/rights")
     );
     assert_eq!(meta(&s, id(&s, "b.png")).copyright_status, CopyrightStatus::PublicDomain);
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
+/// A sidecar another raw developer wrote: develop settings in attributes and elements, a
+/// structured edit history, an unknown namespace.
+const OTHER_APP_SIDECAR: &str = r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Other Toolkit">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+    xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    xmlns:other="http://example.com/other/1.0/"
+    xmp:Rating="2"
+    crs:Version="99.0"
+    crs:Exposure2012="+0.65"
+    crs:HasSettings="True"
+    other:Secret="keep me">
+   <xmpMM:History>
+    <rdf:Seq>
+     <rdf:li stEvt:action="derived" stEvt:parameters="converted from image/x-raw to image/png"/>
+    </rdf:Seq>
+   </xmpMM:History>
+   <crs:ToneCurvePV2012>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>128, 140</rdf:li>
+     <rdf:li>255, 255</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+/// Issue #92: saving merges into another app's sidecar instead of replacing it.
+#[test]
+fn saving_merges_into_another_apps_sidecar() {
+    let src = temp_dir("merge");
+    let lib = temp_dir("merge-lib");
+    write_png(&src.join("shot.png"), 1);
+    std::fs::write(src.join("shot.xmp"), OTHER_APP_SIDECAR).unwrap();
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    s.execute("library.import", &json!({"paths": [src.join("shot.png").to_string_lossy()]})).unwrap();
+    let id = only(&s);
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    s.execute("photo.rate", &json!({"rating": 5})).unwrap();
+    s.execute("photo.setMeta", &json!({"title": "Harbour", "keywords": ["boats"]})).unwrap();
+    s.execute("develop.set", &json!({"control": "effects.clarity", "value": 30})).unwrap();
+    let r = s.execute("photo.saveMetadataToFile", &json!({})).unwrap();
+    assert_eq!(r["merged"][0], src.join("shot.xmp").to_string_lossy().as_ref(), "{r}");
+    let out = std::fs::read_to_string(src.join("shot.xmp")).unwrap();
+    // the other app's data, byte for byte
+    for part in [
+        "crs:Exposure2012=\"+0.65\"",
+        "other:Secret=\"keep me\"",
+        "   <xmpMM:History>\n    <rdf:Seq>\n     <rdf:li stEvt:action=\"derived\" stEvt:parameters=\"converted from image/x-raw to image/png\"/>\n    </rdf:Seq>\n   </xmpMM:History>",
+        "   <crs:ToneCurvePV2012>\n    <rdf:Seq>\n     <rdf:li>0, 0</rdf:li>\n     <rdf:li>128, 140</rdf:li>",
+    ] {
+        assert!(out.contains(part), "lost {part:?}:\n{out}");
+    }
+    let d = lightcraft_meta::parse_xmp(&out).unwrap();
+    assert_eq!(d.metadata.rating, Some(5), "ours replaces theirs");
+    assert_eq!(d.metadata.title.as_deref(), Some("Harbour"));
+    assert_eq!(d.properties.get("crs:Version"), Some(&vec!["99.0".to_string()]));
+    let saved = s.catalog.photo(id).unwrap().develop.clone();
+    // reading it back restores our settings (lc:settings wins over crs:)
+    s.execute("develop.set", &json!({"control": "effects.clarity", "value": 0})).unwrap();
+    s.execute("photo.readMetadataFromFile", &json!({})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().develop, saved);
+    // saving again keeps one LightCraft description and the other app's data
+    s.execute("photo.rate", &json!({"rating": 3})).unwrap();
+    s.execute("photo.saveMetadataToFile", &json!({})).unwrap();
+    let again = std::fs::read_to_string(src.join("shot.xmp")).unwrap();
+    assert_eq!(again.matches("<rdf:Description").count(), 2, "{again}");
+    assert!(again.contains("other:Secret=\"keep me\"") && again.contains("crs:Exposure2012=\"+0.65\""));
+    assert_eq!(lightcraft_meta::parse_xmp(&again).unwrap().metadata.rating, Some(3));
+
+    // a sidecar that isn't XMP is kept as a backup before it is replaced
+    std::fs::write(src.join("shot.xmp"), b"<not xmp").unwrap();
+    let r = s.execute("photo.saveMetadataToFile", &json!({})).unwrap();
+    let backup = r["backups"][0]["backup"].as_str().unwrap().to_string();
+    assert!(backup.contains("shot.xmp.bak-"), "{r}");
+    assert_eq!(std::fs::read(&backup).unwrap(), b"<not xmp");
+    assert_eq!(lightcraft_meta::parse_xmp(&std::fs::read_to_string(src.join("shot.xmp")).unwrap()).unwrap().metadata.rating, Some(3));
+    // … and another one never overwrites the first backup
+    std::fs::write(src.join("shot.xmp"), b"<still not xmp").unwrap();
+    let r = s.execute("photo.saveMetadataToFile", &json!({})).unwrap();
+    let second = r["backups"][0]["backup"].as_str().unwrap().to_string();
+    assert_ne!(second, backup);
+    assert_eq!(std::fs::read(&backup).unwrap(), b"<not xmp");
+    assert_eq!(std::fs::read(&second).unwrap(), b"<still not xmp");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
+/// Issue #92: two catalogued files with one stem (`IMG_1.jpg` + `IMG_1.png`) don't share a
+/// Stem-named sidecar: the first by name keeps `IMG_1.xmp`, the other writes and reads
+/// `IMG_1.png.xmp`.
+#[test]
+fn files_sharing_a_stem_get_their_own_sidecars() {
+    let src = temp_dir("stem");
+    let lib = temp_dir("stem-lib");
+    write_png(&src.join("IMG_1.png"), 1);
+    let img = lightcraft_raster::Rgba8::from_fn(40, 24, |x, y| [(x * 6) as u8, (y * 9) as u8, 7, 255]);
+    let jpg =
+        crate::export::encode_image(&img, &crate::export::ExportOptions { format: crate::export::ExportFormat::Jpeg, ..Default::default() }).unwrap();
+    std::fs::write(src.join("IMG_1.jpg"), jpg).unwrap();
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = |s: &Session, name: &str| s.catalog.photos().find(|p| p.file_name == name).unwrap().id;
+    let (j, p) = (id(&s, "IMG_1.jpg"), id(&s, "IMG_1.png"));
+    assert_eq!(s.sidecar_naming(j), crate::sidecar::SidecarNaming::Stem);
+    assert_eq!(s.sidecar_naming(p), crate::sidecar::SidecarNaming::Full);
+    s.execute("photo.rate", &json!({"ids": [j.0], "rating": 2})).unwrap();
+    s.execute("photo.rate", &json!({"ids": [p.0], "rating": 5})).unwrap();
+    let r = s.execute("photo.saveMetadataToFile", &json!({"ids": [j.0, p.0]})).unwrap();
+    assert_eq!(r["written"].as_array().unwrap().len(), 2, "{r}");
+    let rating = |f: &str| lightcraft_meta::parse_xmp(&std::fs::read_to_string(src.join(f)).unwrap()).unwrap().metadata.rating;
+    assert_eq!(rating("IMG_1.xmp"), Some(2));
+    assert_eq!(rating("IMG_1.png.xmp"), Some(5));
+    // each reads its own back
+    s.execute("photo.rate", &json!({"ids": [j.0, p.0], "rating": 0})).unwrap();
+    s.execute("photo.readMetadataFromFile", &json!({"ids": [j.0, p.0]})).unwrap();
+    assert_eq!((s.catalog.photo(j).unwrap().rating, s.catalog.photo(p).unwrap().rating), (2, 5));
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&lib);
 }

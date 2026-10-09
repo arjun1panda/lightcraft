@@ -23,7 +23,8 @@ impl Session {
             .into_iter()
             .find(|(x, _)| x.name.eq_ignore_ascii_case(name.trim()))
             .ok_or_else(|| format!("unknown export preset `{name}` (see export.presets)"))?;
-        let mut out = preset.params;
+        // a preset saved by another version may hold keys this one doesn't know: not the caller's typo
+        let mut out = crate::export::ExportOptions::known_keys_only(&preset.params);
         if let (Some(o), Some(own)) = (out.as_object_mut(), p.as_object()) {
             for (k, v) in own.iter().filter(|(k, _)| *k != "preset") {
                 o.insert(k.clone(), v.clone());
@@ -54,6 +55,8 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(o) = params.as_object_mut() {
         o.retain(|k, _| !NOT_SETTINGS.contains(&k.as_str()));
     }
+    // a preset that app.export would refuse is refused here, where the typo is on screen
+    crate::export::ExportOptions::validate(ID, &params)?;
     let preset = ExportPreset { name: name.to_string(), params };
     match s.export_presets.iter_mut().find(|x| x.name.eq_ignore_ascii_case(name)) {
         Some(x) => *x = preset,
@@ -96,5 +99,18 @@ pub fn specs() -> Vec<CommandSpec> {
             save
         ),
         cmd!("export.deletePreset", "Delete Export Preset", [], None, "{name} — removes a user preset → presets", always, delete),
+        cmd!(
+            query "export.checkTarget",
+            "Check Output Path",
+            [],
+            None,
+            "{path} — fails when writing `path` would replace a photo's original (or its XMP sidecar) in the library; front ends call it before saving a render or screenshot to a user-given path → {path}",
+            always,
+            |s, p| {
+                let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad("export.checkTarget", "missing `path`"))?;
+                s.check_write_target(path).map_err(|e| bad("export.checkTarget", e))?;
+                Ok(json!({"path": path}))
+            }
+        ),
     ]
 }

@@ -26,6 +26,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                         ("detail", Icon::Single, ViewMode::Detail, "Detail (D)"),
                         ("compare", Icon::Compare, ViewMode::Compare, "Compare (Shift+C)"),
                         ("survey", Icon::Survey, ViewMode::Survey, "Survey (N)"),
+                        ("people", Icon::Subject, ViewMode::People, "People"),
                     ] {
                         if icon_button(ui, id, icon, vec2(32.0, 32.0), app.ui.view == mode, true, tip).clicked() {
                             let _ = app.run(&format!("view.{id}"), json!({}));
@@ -48,18 +49,21 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
 
 /// Width of the centre group: the rating/flag pill, then Copy/Paste Edit Settings and its gear.
 const PILL_W: f32 = 196.0;
-const CENTRE_W: f32 = PILL_W + 10.0 + 136.0 + 4.0 + 30.0;
 
 /// The rating/flag pill and copy/paste settings, between `from` and `to` (the side groups): the
 /// copy buttons go first when there is no room (they are in the Edit menu too), then the pill.
 fn centre(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect, from: f32, to: f32) {
     let t = Tokens::get(ui.ctx());
+    let has_clip = app.session.clipboard.is_some();
+    let label = crate::i18n::tr(if has_clip { "Paste Edit Settings" } else { "Copy Edit Settings" });
+    let copy_width = (ui.painter().layout_no_wrap(label.to_string(), t.font(13.0), t.text_label).size().x + 24.0).max(136.0);
+    let centre_width = PILL_W + 10.0 + copy_width + 4.0 + 30.0;
     let room = to - from;
     if room < PILL_W {
         return;
     }
-    let with_copy = room >= CENTRE_W;
-    let w = if with_copy { CENTRE_W } else { PILL_W };
+    let with_copy = room >= centre_width;
+    let w = if with_copy { centre_width } else { PILL_W };
     // where it sits with room to spare (slightly left of centre), kept between the side groups
     let left = (full.center().x - 60.0 - PILL_W / 2.0).clamp(from, to - w);
     let active = app.session.active().and_then(|id| app.session.catalog.photo(id).cloned());
@@ -98,9 +102,7 @@ fn centre(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect, from: f32, to:
     if !with_copy {
         return;
     }
-    let copy_r = Rect::from_min_size(pos2(pill.right() + 10.0, pill.top()), vec2(136.0, 30.0));
-    let has_clip = app.session.clipboard.is_some();
-    let label = if has_clip { "Paste Edit Settings" } else { "Copy Edit Settings" };
+    let copy_r = Rect::from_min_size(pos2(pill.right() + 10.0, pill.top()), vec2(copy_width, 30.0));
     let cresp = ui.interact(copy_r, egui::Id::new("copy-settings"), Sense::click());
     register(ui.ctx(), "button:copySettings", copy_r);
     ui.painter().rect_filled(copy_r, 15.0, if cresp.hovered() { t.hover } else { t.canvas });
@@ -108,7 +110,7 @@ fn centre(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect, from: f32, to:
     if cresp.clicked() && active.is_some() {
         let _ = if has_clip { app.run("develop.paste", json!({})) } else { app.run("develop.copy", json!({})) };
         let msg = if has_clip { "Settings pasted" } else { "Edit settings copied" };
-        app.toast(ui.ctx(), msg);
+        app.toast(ui.ctx(), crate::i18n::tr(msg));
     }
     let gear_r = Rect::from_min_size(pos2(copy_r.right() + 4.0, pill.top()), vec2(30.0, 30.0));
     let gresp = ui.interact(gear_r, egui::Id::new("copy-gear"), Sense::click());
@@ -159,6 +161,11 @@ fn right_side(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect) -> f32 {
         {
             let _ = app.run("view.beforeAfter", json!({}));
         }
+        if app.ui.view == ViewMode::Detail
+            && icon_button(&mut child, "faceBoxes", Icon::FaceBox, vec2(30.0, 30.0), app.ui.face_boxes, true, "Face boxes").clicked()
+        {
+            let _ = app.run("view.faceBoxes", json!({}));
+        }
         if icon_button(&mut child, "filmstrip", Icon::Filmstrip, vec2(30.0, 30.0), app.ui.filmstrip, true, "Filmstrip (/)").clicked() {
             let _ = app.run("view.filmstrip", json!({}));
         }
@@ -166,17 +173,17 @@ fn right_side(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect) -> f32 {
         let zoom_label = match app.ui.zoom {
             Zoom::Fit => "Fit".to_string(),
             Zoom::Fill => "Fill".to_string(),
-            Zoom::Percent(p) => format!("{p}%"),
+            Zoom::Percent(p) => format!("{p:.0}%"),
         };
-        let zr = crate::widgets::dropdown(&mut child, "zoom", &zoom_label, t.font(13.0), t.text_label);
+        let zr = crate::widgets::dropdown(&mut child, "zoom", crate::i18n::tr(&zoom_label), t.font(13.0), t.text_label);
         egui::Popup::menu(&zr).show(|ui| {
             for (label, z) in [
                 ("Fit", Zoom::Fit),
                 ("Fill", Zoom::Fill),
-                ("50%", Zoom::Percent(50)),
-                ("100%", Zoom::Percent(100)),
-                ("200%", Zoom::Percent(200)),
-                ("400%", Zoom::Percent(400)),
+                ("50%", Zoom::Percent(50.0)),
+                ("100%", Zoom::Percent(100.0)),
+                ("200%", Zoom::Percent(200.0)),
+                ("400%", Zoom::Percent(400.0)),
             ] {
                 if ui.selectable_label(app.ui.zoom == z, label).clicked() {
                     app.ui.zoom = z;
@@ -185,7 +192,13 @@ fn right_side(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect) -> f32 {
             }
         });
         child.add_space(6.0);
-        let cz = crate::widgets::dropdown(&mut child, "clickZoom", &format!("Click {}:1", app.ui.click_zoom / 100), t.font(13.0), t.text_label);
+        let cz = crate::widgets::dropdown(
+            &mut child,
+            "clickZoom",
+            &crate::i18n::tr_format!("Click {}:1", app.ui.click_zoom / 100),
+            t.font(13.0),
+            t.text_label,
+        );
         egui::Popup::menu(&cz).show(|ui| {
             for pct in crate::state::CLICK_ZOOMS {
                 if ui.selectable_label(app.ui.click_zoom == pct, format!("{}:1", pct / 100)).clicked() {
@@ -216,7 +229,7 @@ fn sort_menu(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     use lightcraft_catalog::GroupBy;
     use lightcraft_catalog::SortKey::*;
     let cur = app.session.sort;
-    ui.label(egui::RichText::new("Sort by").weak());
+    ui.label(egui::RichText::new(crate::i18n::tr("Sort by")).weak());
     for (label, key, k) in [
         ("Capture Date", CaptureDate, "captureDate"),
         ("Import Date", ImportDate, "importDate"),
@@ -224,20 +237,27 @@ fn sort_menu(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         ("File Name", FileName, "fileName"),
         ("Rating", Rating, "rating"),
         ("File Size", FileSize, "fileSize"),
+        ("Random", Random, "random"),
     ] {
-        if ui.selectable_label(cur.key == key, label).clicked() {
+        if ui.selectable_label(cur.key == key, crate::i18n::tr(label)).clicked() {
             let _ = app.run("library.sort", json!({"key": k}));
         }
     }
-    ui.separator();
-    if ui.selectable_label(cur.ascending, "Ascending").clicked() {
-        let _ = app.run("library.sort", json!({"ascending": true}));
-    }
-    if ui.selectable_label(!cur.ascending, "Descending").clicked() {
-        let _ = app.run("library.sort", json!({"ascending": false}));
+    if cur.key == Random && ui.button(crate::i18n::tr("Reshuffle")).clicked() {
+        let _ = app.run("library.shuffle", json!({}));
     }
     ui.separator();
-    ui.label(egui::RichText::new("Group by date").weak());
+    // a shuffle has no direction worth choosing
+    ui.add_enabled_ui(cur.key != Random, |ui| {
+        if ui.selectable_label(cur.key != Random && cur.ascending, crate::i18n::tr("Ascending")).clicked() {
+            let _ = app.run("library.sort", json!({"ascending": true}));
+        }
+        if ui.selectable_label(cur.key != Random && !cur.ascending, crate::i18n::tr("Descending")).clicked() {
+            let _ = app.run("library.sort", json!({"ascending": false}));
+        }
+    });
+    ui.separator();
+    ui.label(egui::RichText::new(crate::i18n::tr("Group by date")).weak());
     for (label, g, k) in [
         ("Automatic", GroupBy::Auto, "auto"),
         ("Day", GroupBy::Day, "day"),
@@ -245,7 +265,7 @@ fn sort_menu(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         ("Year", GroupBy::Year, "year"),
         ("None", GroupBy::None, "none"),
     ] {
-        if ui.selectable_label(cur.group == g, label).clicked() {
+        if ui.selectable_label(cur.group == g, crate::i18n::tr(label)).clicked() {
             let _ = app.run("library.sort", json!({"group": k}));
         }
     }

@@ -8,6 +8,40 @@ use crate::icons::{Icon, paint};
 use crate::theme::Tokens;
 use crate::widgets::{icon_button, register};
 
+/// The bar doubles as the window's title bar: dragging its empty space moves the window and a
+/// double-click zooms or restores it. Registered before the bar's widgets so they win the click.
+fn window_handle(app: &LightcraftApp, ui: &mut egui::Ui, content: Rect, margin_left: f32, margin_right: f32) {
+    use crate::titlebar::{Gesture, WindowState, command_for};
+    let bar = Rect::from_min_max(pos2(content.left() - margin_left, content.top()), pos2(content.right() + margin_right, content.bottom()));
+    register(ui.ctx(), "region:titlebar", bar);
+    let handle = egui::Id::new("titlebar-handle");
+    let resp = ui.interact(bar, handle, Sense::click_and_drag());
+    // a press that began on a button or the search field is theirs: dragging off it must not move the window
+    // (while pressing, egui hovers every widget under the pointer; once the drag starts, only the dragged one)
+    let ctx = ui.ctx().clone();
+    let memo = egui::Id::new("titlebar-press-on-widget");
+    if resp.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_pressed()) {
+        let hovered = ctx.interaction_snapshot(|s| s.hovered.clone());
+        let on_widget =
+            hovered.iter().any(|id| *id != handle && ctx.read_response(*id).is_some_and(|r| r.sense.senses_click() || r.sense.senses_drag()));
+        ctx.data_mut(|d| d.insert_temp(memo, on_widget));
+    }
+    let on_widget = ctx.data(|d| d.get_temp::<bool>(memo)).unwrap_or(false);
+    let gesture = if resp.double_clicked_by(egui::PointerButton::Primary) {
+        Some(Gesture::DoubleClicked)
+    } else if resp.drag_started_by(egui::PointerButton::Primary) && !on_widget {
+        Some(Gesture::DragStarted)
+    } else {
+        None
+    };
+    if let Some(g) = gesture {
+        let window = WindowState { maximized: ui.input(|i| i.viewport().maximized).unwrap_or(false), fullscreen: app.window_is_fullscreen };
+        if let Some(cmd) = command_for(g, window) {
+            ui.ctx().send_viewport_cmd(cmd);
+        }
+    }
+}
+
 pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let left = if app.integrated_titlebar { 78 } else { 10 };
@@ -16,6 +50,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin { left, right: 12, top: 0, bottom: 0 }))
         .show(ui, |ui| {
             let full = ui.max_rect();
+            if app.integrated_titlebar {
+                window_handle(app, ui, full, left as f32, 12.0);
+            }
             let mut sw = 640.0f32.min(full.width() - 460.0).max(200.0);
             if !app.native_menu {
                 // leave room for the in-window menus left of the (centred) search field
@@ -59,7 +96,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 ui.new_child(egui::UiBuilder::new().max_rect(sr.shrink2(vec2(10.0, 4.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
             let empty = app.ui.search.is_empty();
             if empty && !focused {
-                let g = child.painter().layout_no_wrap("Search Photos".into(), t.font(13.5), t.text_dim);
+                let g = child.painter().layout_no_wrap(crate::i18n::tr("Search Photos").into(), t.font(13.5), t.text_dim);
                 let w = g.size().x + 24.0;
                 let x0 = sr.center().x - w / 2.0;
                 paint(child.painter(), Rect::from_min_size(pos2(x0, sr.center().y - 8.0), vec2(16.0, 16.0)), Icon::Search, t.text_dim);
@@ -102,7 +139,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 ui.painter().text(c, Align2::CENTER_CENTER, active.to_string(), t.semibold(9.5), t.canvas);
             }
             let fresp = fresp.on_hover_text(if active > 0 {
-                format!("Filter bar — {active} active filter{}", if active == 1 { "" } else { "s" })
+                crate::i18n::tr_format!("Filter bar — {active} active filter{}", if active == 1 { "" } else { "s" }, active = active)
             } else {
                 "Filter bar".into()
             });
@@ -111,9 +148,20 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             }
             // right icons
             let mut x = full.right() - 18.0;
+            // saving is failing: the cloud icon turns into a warning until a save succeeds
+            let unsaved = app.session.unsaved().map(|(n, e)| {
+                crate::i18n::tr_format!(
+                    "{n} change{} saved in memory but not written to disk: {e}\nLightCraft retries automatically; quitting now would lose {}.",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "it" } else { "them" },
+                    e = e,
+                    n = n
+                )
+            });
+            let cloud_tip = unsaved.as_deref().unwrap_or("Local library — no cloud account needed");
             for (id, icon, tip, cmd) in [
                 ("discord", Icon::Chat, "Join the ArtCraft community on Discord", "app.discord"),
-                ("cloud", Icon::Cloud, "Local library — no cloud account needed", ""),
+                ("cloud", Icon::Cloud, cloud_tip, ""),
                 ("help", Icon::Help, "Keyboard shortcuts", "app.shortcuts"),
                 ("share", Icon::Share, "Export", "dialog.export"),
                 ("bell", Icon::Bell, "Activity", "panel.activity"),
@@ -121,7 +169,21 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 let r = Rect::from_center_size(pos2(x, full.center().y), vec2(28.0, 28.0));
                 let resp = ui.interact(r, egui::Id::new(("top", id)), Sense::click()).on_hover_text(tip);
                 register(ui.ctx(), format!("icon:{id}"), r);
-                paint(ui.painter(), r.shrink(5.0), icon, if resp.hovered() { t.text } else { t.icon });
+                let warn = id == "cloud" && unsaved.is_some();
+                let colour = if warn {
+                    t.caution
+                } else if resp.hovered() {
+                    t.text
+                } else {
+                    t.icon
+                };
+                paint(ui.painter(), r.shrink(5.0), icon, colour);
+                if warn {
+                    let c = r.right_top() + vec2(-5.0, 6.0);
+                    ui.painter().circle_filled(c, 6.0, t.reject);
+                    ui.painter().text(c, Align2::CENTER_CENTER, "!", t.semibold(9.5), t.canvas);
+                    register(ui.ctx(), "indicator:unsaved", r);
+                }
                 if resp.clicked() && !cmd.is_empty() {
                     let _ = app.run(cmd, json!({}));
                 }

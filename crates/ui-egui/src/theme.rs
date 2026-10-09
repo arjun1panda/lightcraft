@@ -7,6 +7,28 @@ use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
 
 pub const FONT_SEMIBOLD: &str = "semibold";
 
+/// Shared colour-label palette for badges, thumbnail surrounds and feedback.
+pub fn label_color(label: lightcraft_catalog::ColorLabel) -> Color32 {
+    use lightcraft_catalog::ColorLabel;
+    match label {
+        ColorLabel::Red => Color32::from_rgb(222, 72, 72),
+        ColorLabel::Yellow => Color32::from_rgb(232, 196, 58),
+        ColorLabel::Green => Color32::from_rgb(88, 176, 92),
+        ColorLabel::Blue => Color32::from_rgb(72, 130, 222),
+        ColorLabel::Purple => Color32::from_rgb(158, 100, 210),
+    }
+}
+
+/// A translucent label colour over thumbnail chrome; selection remains brighter.
+pub fn label_background(base: Color32, label: Option<lightcraft_catalog::ColorLabel>, selected: bool) -> Color32 {
+    label.map_or(base, |l| base.lerp_to_gamma(label_color(l), if selected { 0.32 } else { 0.22 }))
+}
+
+/// Label confirmations use a pale colour and dark text, distinct from neutral/error HUDs.
+pub fn label_toast_colors(label: lightcraft_catalog::ColorLabel) -> (Color32, Color32) {
+    (Color32::WHITE.lerp_to_gamma(label_color(label), 0.3), Color32::from_rgb(36, 24, 24))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Tokens {
     /// Top bar, side panels, bottom bar, tool strip.
@@ -107,17 +129,57 @@ impl Tokens {
 }
 
 pub fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(font_definitions(lightcraft_engine::CRAFT_FONTS));
+}
+
+/// Inter (bundled) for Latin text, egui's default fonts, then the craft-fonts CJK faces as the last
+/// fallback of every family — the active language's own script first, so shared Han characters keep
+/// that language's forms. Without craft-fonts (`craft` empty) CJK text has no glyphs and shows as
+/// boxes.
+pub fn font_definitions(craft: &'static [lightcraft_engine::CraftFont]) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("Inter".into(), Arc::new(FontData::from_static(include_bytes!("../../../assets/fonts/Inter-Regular.ttf"))));
     fonts.font_data.insert("Inter-SemiBold".into(), Arc::new(FontData::from_static(include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf"))));
-    let fallback: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    // Craft-fonts faces in preference order for a family drawn in `style`.
+    let fallback = |style: &str| {
+        lightcraft_engine::fonts::cjk_fallback(craft, crate::i18n::language().script(), style)
+            .into_iter()
+            .map(craft_font_name)
+            .collect::<Vec<String>>()
+    };
+    let (regular, bold) = (fallback("Regular"), fallback("Bold"));
+    for name in regular.iter().chain(bold.iter()) {
+        if let Some(font) = craft.iter().find(|font| &craft_font_name(font) == name) {
+            fonts.font_data.insert(name.clone(), Arc::new(FontData::from_static(font.bytes)));
+        }
+    }
+    let defaults: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let mut prop = vec!["Inter".to_string()];
-    prop.extend(fallback.clone());
+    prop.extend(defaults.iter().cloned());
+    prop.extend(regular);
     fonts.families.insert(FontFamily::Proportional, prop);
     let mut semi = vec!["Inter-SemiBold".to_string()];
-    semi.extend(fallback);
+    semi.extend(defaults);
+    semi.extend(bold);
     fonts.families.insert(FontFamily::Name(FONT_SEMIBOLD.into()), semi);
-    ctx.set_fonts(fonts);
+    fonts.families.entry(FontFamily::Monospace).or_default().extend(fallback("Regular"));
+    fonts
+}
+
+/// The embedded font families for the About box: Inter, plus the craft-fonts families when built
+/// with them.
+pub fn font_credits() -> String {
+    let mut families = vec!["Inter"];
+    for f in lightcraft_engine::CRAFT_FONTS {
+        if !families.contains(&f.family) {
+            families.push(f.family);
+        }
+    }
+    families.join(" / ")
+}
+
+fn craft_font_name(f: &lightcraft_engine::CraftFont) -> String {
+    format!("craft-fonts {} {}", f.family, f.style)
 }
 
 pub fn apply(ctx: &egui::Context) {

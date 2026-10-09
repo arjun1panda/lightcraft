@@ -35,7 +35,9 @@ fn mount_parents() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if cfg!(target_os = "macos") {
         out.push("/Volumes".into());
-    } else if cfg!(target_os = "linux") {
+    } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        // Linux desktops mount under /media/$USER or /run/media/$USER; FreeBSD's automounter
+        // (automount/autofs, or a desktop's) under /media. Missing folders are skipped.
         if let Ok(user) = std::env::var("USER") {
             out.push(format!("/media/{user}").into());
             out.push(format!("/run/media/{user}").into());
@@ -189,7 +191,7 @@ pub fn devices_in(parents: &[std::path::PathBuf], extra: Vec<std::path::PathBuf>
 
 /// The volume's `DCIM` folder: the usual spellings are checked directly, so a volume's root is
 /// only listed (other spellings on a case-sensitive volume) off Windows, whose drives aren't.
-fn dcim_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
+pub fn dcim_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Some(p) = ["DCIM", "dcim"].iter().map(|n| root.join(n)).find(|p| p.is_dir()) {
         return Some(p);
     }

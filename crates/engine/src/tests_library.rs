@@ -113,6 +113,7 @@ fn close_writes_snapshot_and_view_state() {
     let expect = s.catalog.to_snapshot();
     s.close_library().unwrap();
     assert_eq!(std::fs::metadata(dir.join("catalog.log")).unwrap().len(), 0);
+    drop(s); // one session per library (issue #99)
 
     let s2 = open(&dir, true);
     let r = &s2.library.as_ref().unwrap().report;
@@ -178,6 +179,7 @@ fn new_library_without_seed_is_empty_and_compacts() {
     assert!(p["snapshots"].as_u64() >= Some(1), "{p}");
     assert!(p["lastSnapshot"]["bytes"].as_u64() > Some(0), "{p}");
     assert!(p["lastSnapshot"]["totalMs"].as_f64() >= p["lastSnapshot"]["serializeMs"].as_f64(), "{p}");
+    drop(s); // one session per library (issue #99)
     let s2 = open(&dir, true);
     assert_eq!(s2.catalog.len(), 0, "an existing library is never seeded");
     assert_eq!(s2.catalog.albums().count(), 1);
@@ -207,6 +209,39 @@ fn profile_favorites_and_recent_survive_reopen() {
     assert_eq!(menu["groups"][0]["name"], "Basic");
     let list = s.execute("profiles.list", &json!({})).unwrap();
     assert!(list.as_array().unwrap().iter().any(|p| p["id"] == "lc.bw.sepia" && p["favorite"] == true));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_shown_library_folder_survives_reopen() {
+    let dir = temp_dir("libfolder");
+    let mut s = open(&dir, true);
+    let id = s.catalog.alloc_photo_id();
+    let p = lightcraft_catalog::Photo::new(
+        id,
+        lightcraft_catalog::Source::File { path: "/pics/trip/a.jpg".into() },
+        "a.jpg",
+        "JPEG",
+        60,
+        40,
+        "2026-01-01T10:00:00",
+    );
+    s.commit("Add", lightcraft_catalog::Op::AddPhoto { photo: Box::new(p) }).unwrap();
+    s.execute("library.source", &json!({"kind": "libraryFolder", "path": "/pics/trip"})).unwrap();
+    s.save_view();
+    drop(s);
+    let s = open(&dir, false);
+    assert_eq!((s.source, s.library_folder.as_deref()), (crate::LibrarySource::LibraryFolder, Some("/pics/trip")));
+    drop(s);
+    // a folder that holds none of the library's photos any more opens on everything too
+    std::fs::write(dir.join("view.json"), br#"{"source": {"kind": "libraryFolder"}, "library_folder": "/no/such/folder"}"#).unwrap();
+    let s = open(&dir, false);
+    assert_eq!((s.source, s.library_folder.clone()), (crate::LibrarySource::All, None));
+    drop(s);
+    // a view file that names the source but no folder opens on everything, never an empty grid
+    std::fs::write(dir.join("view.json"), br#"{"source": {"kind": "libraryFolder"}}"#).unwrap();
+    let s = open(&dir, false);
+    assert_eq!((s.source, s.library_folder), (crate::LibrarySource::All, None));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -375,4 +410,33 @@ fn scale_100k_library_queries() {
     });
     worst.sort_by(|a, b| b.1.total_cmp(&a.1));
     eprintln!("slowest: {:?}", &worst[..3]);
+}
+
+/// Issue #99: a library is open in one session at a time. A second opener is refused (nothing
+/// read or written), the owning session can reopen it, and it is free again once closed.
+#[test]
+fn a_library_open_elsewhere_is_refused() {
+    let dir = temp_dir("locked");
+    let mut s = open(&dir, true);
+    s.execute("photo.rate", &json!({"rating": 3})).unwrap();
+    let log = std::fs::read(dir.join("catalog.log")).unwrap();
+
+    let mut other = Session::new();
+    let e = other.open_library(&dir, true).unwrap_err();
+    assert!(matches!(e, crate::EngineError::LibraryInUse(_)), "{e:?}");
+    assert!(e.to_string().contains("already open in"), "{e}");
+    assert!(other.library.is_none());
+    assert_eq!(std::fs::read(dir.join("catalog.log")).unwrap(), log, "the refused opener wrote nothing");
+
+    // the session that has it open may reopen it (Settings → Open Library on the same folder)
+    s.close_library().unwrap();
+    s.open_library(&dir, true).unwrap();
+    assert!(other.open_library(&dir, true).is_err(), "still locked after reopening");
+    s.execute("photo.rate", &json!({"rating": 4})).unwrap();
+    let expect = s.catalog.to_snapshot();
+
+    drop(s);
+    other.open_library(&dir, true).unwrap();
+    assert_eq!(other.catalog.to_snapshot(), expect);
+    let _ = std::fs::remove_dir_all(&dir);
 }

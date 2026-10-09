@@ -202,6 +202,8 @@ pub enum Anchor {
 #[serde(default, rename_all = "camelCase")]
 pub struct Watermark {
     pub text: String,
+    /// Basic Japanese vertical lettering: upright glyphs in columns from right to left.
+    pub vertical: bool,
     /// Text height as a fraction of the image's short edge.
     pub size: f32,
     /// 0..1.
@@ -226,6 +228,7 @@ impl Default for Watermark {
     fn default() -> Self {
         Self {
             text: String::new(),
+            vertical: false,
             size: 0.035,
             opacity: 0.7,
             anchor: Anchor::BottomRight,
@@ -242,10 +245,60 @@ impl Default for Watermark {
 /// Inter SemiBold (OFL, see assets/ATTRIBUTION.md).
 static WATERMARK_FONT: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf");
 
+/// The watermark faces: Inter first, then the craft-fonts CJK faces (Mincho first, the watermark's
+/// serif look; then any other CJK face — a watermark has no UI language, so every CJK script is
+/// offered). Without craft-fonts that is Inter alone, and CJK characters draw as Inter's
+/// missing-glyph box.
+fn watermark_fonts(craft: &'static [crate::fonts::CraftFont]) -> Vec<ab_glyph::FontRef<'static>> {
+    let mut cjk: Vec<_> = crate::fonts::cjk(craft).collect();
+    cjk.sort_by_key(|f| !f.is_mincho());
+    std::iter::once(WATERMARK_FONT)
+        .chain(cjk.into_iter().map(|f| f.bytes))
+        .filter_map(|bytes| ab_glyph::FontRef::try_from_slice(bytes).ok())
+        .collect()
+}
+
+/// Shape a whole grapheme in one cell. CJK uses vertical origins and forms; Latin stays upright.
+/// Unlike Unicode presentation-form characters, GSUB works with BIZ UD fonts too.
+fn watermark_cell_glyphs(
+    font: &ab_glyph::FontRef<'_>,
+    data: &harfrust::ShaperData,
+    text: &str,
+    vertical: bool,
+    px: f32,
+    left: f32,
+    top: f32,
+) -> Option<Vec<ab_glyph::Glyph>> {
+    use ab_glyph::{Font, ScaleFont};
+    let face = harfrust::FontRef::new(font.font_data()).ok()?;
+    let mut buf = harfrust::UnicodeBuffer::new();
+    buf.push_str(text);
+    buf.set_direction(if vertical { harfrust::Direction::TopToBottom } else { harfrust::Direction::LeftToRight });
+    buf.guess_segment_properties();
+    let shaped = data.shaper(&face).build().shape(buf, harfrust::ShapeOptions::new());
+    if shaped.glyph_infos().is_empty() {
+        return None;
+    }
+    let sf = font.as_scaled(px);
+    let (sx, sy) = (sf.h_scale_factor(), sf.v_scale_factor());
+    let advance_x = shaped.glyph_positions().iter().map(|p| p.x_advance as f32 * sx).sum::<f32>();
+    let advance_y = shaped.glyph_positions().iter().map(|p| -(p.y_advance as f32) * sy).sum::<f32>();
+    let (mut x, mut y) = if vertical { (left + px / 2.0, top + (px - advance_y) / 2.0) } else { (left + (px - advance_x) / 2.0, top + sf.ascent()) };
+    let mut glyphs = Vec::new();
+    for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+        let gid = u16::try_from(info.glyph_id).ok().filter(|g| *g != 0)?;
+        let pen = ab_glyph::point(x + pos.x_offset as f32 * sx, y - pos.y_offset as f32 * sy);
+        glyphs.push(ab_glyph::GlyphId(gid).with_scale_and_position(px, pen));
+        x += pos.x_advance as f32 * sx;
+        y -= pos.y_advance as f32 * sy;
+    }
+    Some(glyphs)
+}
+
 /// Draw `wm` onto `img` (straight alpha blending of the encoded values).
 pub fn draw_watermark(img: &mut Rgba8, wm: &Watermark) {
     let width = img.width;
-    watermark_coverage(img.width, img.height, wm, |x, y, k, col| {
+    watermark_coverage(img.width, img.height, wm, crate::fonts::CRAFT_FONTS, |x, y, k, col| {
         let p = &mut img.data[y * width + x];
         for c in 0..3 {
             p[c] = (p[c] as f32 + (col[c] as f32 - p[c] as f32) * k).round() as u8;
@@ -258,14 +311,14 @@ pub fn draw_watermark(img: &mut Rgba8, wm: &Watermark) {
 pub fn draw_watermark_deep(img: &mut DeepImage, wm: &Watermark) {
     let (width, trc) = (img.width, img.space.trc());
     match &mut img.samples {
-        DeepSamples::U16(v) => watermark_coverage(img.width, img.height, wm, |x, y, k, col| {
+        DeepSamples::U16(v) => watermark_coverage(img.width, img.height, wm, crate::fonts::CRAFT_FONTS, |x, y, k, col| {
             let i = (y * width + x) * 3;
             for c in 0..3 {
                 let p = v[i + c] as f32;
                 v[i + c] = (p + (col[c] as f32 * 257.0 - p) * k).round().clamp(0.0, 65535.0) as u16;
             }
         }),
-        DeepSamples::F32(v) => watermark_coverage(img.width, img.height, wm, |x, y, k, col| {
+        DeepSamples::F32(v) => watermark_coverage(img.width, img.height, wm, crate::fonts::CRAFT_FONTS, |x, y, k, col| {
             let i = (y * width + x) * 3;
             for c in 0..3 {
                 let target = trc.decode(col[c] as f32 / 255.0);
@@ -276,9 +329,16 @@ pub fn draw_watermark_deep(img: &mut DeepImage, wm: &Watermark) {
 }
 
 /// Lay out `wm` on a `width × height` image and call `blend(x, y, coverage × opacity, colour)` for
-/// every covered pixel (shadow pass first).
-fn watermark_coverage(width: usize, height: usize, wm: &Watermark, mut blend_px: impl FnMut(usize, usize, f32, [u8; 3])) {
-    use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
+/// every covered pixel (shadow pass first). `craft` is [`crate::fonts::CRAFT_FONTS`] (a parameter
+/// so tests can render without it).
+fn watermark_coverage(
+    width: usize,
+    height: usize,
+    wm: &Watermark,
+    craft: &'static [crate::fonts::CraftFont],
+    mut blend_px: impl FnMut(usize, usize, f32, [u8; 3]),
+) {
+    use ab_glyph::{Font, PxScale, ScaleFont, point};
     if !wm.image.trim().is_empty() {
         logo_coverage(width, height, wm, blend_px);
         return;
@@ -287,24 +347,97 @@ fn watermark_coverage(width: usize, height: usize, wm: &Watermark, mut blend_px:
     if text.is_empty() || width == 0 || height == 0 {
         return;
     }
-    let Ok(font) = FontRef::try_from_slice(WATERMARK_FONT) else { return };
+    let fonts = watermark_fonts(craft);
+    let Some(latin) = fonts.first() else { return };
+    let vertical_data: Vec<_> = if wm.vertical {
+        fonts.iter().map(|font| harfrust::FontRef::new(font.font_data()).ok().map(|face| harfrust::ShaperData::new(&face))).collect()
+    } else {
+        Vec::new()
+    };
     let short = width.min(height) as f32;
     let px = (wm.size.clamp(0.005, 0.5) * short).max(6.0);
-    let sf = font.as_scaled(PxScale::from(px));
-    // Lay out one line.
     let mut glyphs = Vec::new();
     let mut x = 0.0f32;
+    let mut y = 0.0f32;
+    let mut tw = 0.0f32;
     let mut prev = None;
-    for ch in text.chars() {
-        let id = sf.glyph_id(ch);
-        if let Some(p) = prev {
-            x += sf.kern(p, id);
+    let columns = text.split('\n').count();
+    let mut column = 0usize;
+    use unicode_segmentation::UnicodeSegmentation;
+    // Horizontal watermarks retain scalar layout and kerning; only vertical cells use graphemes.
+    let cells: Box<dyn Iterator<Item = &str>> =
+        if wm.vertical { Box::new(text.graphemes(true)) } else { Box::new(text.char_indices().filter_map(|(i, c)| text.get(i..i + c.len_utf8()))) };
+    for cell in cells {
+        let Some(original) = cell.chars().next() else { continue };
+        if cell == "\n" || (wm.vertical && cell == "\r\n") {
+            if wm.vertical {
+                column = column.saturating_add(1);
+                tw = tw.max(y);
+                y = 0.0;
+            } else {
+                tw = tw.max(x);
+                x = 0.0;
+                y += px;
+            }
+            prev = None;
+            continue;
         }
-        glyphs.push(id.with_scale_and_position(px, point(x, sf.ascent())));
-        x += sf.h_advance(id);
-        prev = Some(id);
+        let cjk = matches!(original as u32, 0x3000..=0x30FF | 0x3400..=0x9FFF | 0xFF01..=0xFF60);
+        if wm.vertical && (cjk || cell.chars().count() > 1) {
+            let left = columns.saturating_sub(column.saturating_add(1)) as f32 * px;
+            let shaped = fonts.iter().zip(&vertical_data).enumerate().find_map(|(face, (font, data))| {
+                let data = data.as_ref()?;
+                let cluster = watermark_cell_glyphs(font, data, cell, cjk, px, left, y)?;
+                let substituted = cluster.len() != 1 || cluster.first().is_some_and(|g| g.id != font.glyph_id(original));
+                if cjk && !substituted && matches!(original, '、' | '。' | 'ー' | '（' | '）' | '「' | '」' | '『' | '』' | '【' | '】') {
+                    return None;
+                }
+                Some((face, cluster))
+            });
+            if let Some((face, cluster)) = shaped {
+                glyphs.extend(cluster.into_iter().map(|g| (face, g, None)));
+                y += px;
+                continue;
+            }
+        }
+        let vertical_form = match original {
+            '、' => '︑',
+            '。' => '︒',
+            '（' => '︵',
+            '）' => '︶',
+            '「' => '﹁',
+            '」' => '﹂',
+            '『' => '﹃',
+            '』' => '﹄',
+            '【' => '︻',
+            '】' => '︼',
+            '…' => '︙',
+            other => other,
+        };
+        let has = |font: &ab_glyph::FontRef<'_>, c: char| font.glyph_id(c).0 != 0;
+        let ch = if wm.vertical && fonts.iter().skip(1).any(|f| has(f, vertical_form)) { vertical_form } else { original };
+        // The first face with the glyph; Inter (its missing-glyph box) when none has it.
+        let face = fonts.iter().position(|f| has(f, ch)).unwrap_or(0);
+        let sf = fonts.get(face).unwrap_or(latin).as_scaled(PxScale::from(px));
+        let id = sf.glyph_id(ch);
+        if wm.vertical {
+            let left = columns.saturating_sub(column.saturating_add(1)) as f32 * px;
+            let pen = point(left + (px - sf.h_advance(id)) / 2.0, y + sf.ascent());
+            let rotation = matches!(original, 'ー' | '—' | '–').then_some((left + px / 2.0, y + px / 2.0));
+            glyphs.push((face, id.with_scale_and_position(px, pen), rotation));
+            y += px;
+        } else {
+            if let Some((previous_face, previous)) = prev
+                && previous_face == face
+            {
+                x += sf.kern(previous, id);
+            }
+            glyphs.push((face, id.with_scale_and_position(px, point(x, y + sf.ascent())), None));
+            x += sf.h_advance(id);
+            prev = Some((face, id));
+        }
     }
-    let (tw, th) = (x, sf.ascent() - sf.descent());
+    let (tw, th) = if wm.vertical { (columns as f32 * px, tw.max(y)) } else { (tw.max(x), y + px) };
     let inset = wm.inset.clamp(0.0, 0.4) * short;
     let (w, h) = (width as f32, height as f32);
     use Anchor::*;
@@ -328,10 +461,17 @@ fn watermark_coverage(width: usize, height: usize, wm: &Watermark, mut blend_px:
     let passes: &[(f32, [u8; 3], f32)] =
         if wm.shadow { &[((px * 0.05).max(1.0), [0, 0, 0], 0.45), (0.0, wm.color, 1.0)] } else { &[(0.0, wm.color, 1.0)] };
     for &(off, col, a) in passes {
-        for g in &glyphs {
-            if let Some(o) = font.outline_glyph(g.clone()) {
+        for (face, g, rotation) in &glyphs {
+            if let Some(o) = fonts.get(*face).and_then(|font| font.outline_glyph(g.clone())) {
                 let b = o.px_bounds();
-                o.draw(|gx, gy, cov| blend((ox + off + b.min.x) as i32 + gx as i32, (oy + off + b.min.y) as i32 + gy as i32, cov, col, a * alpha));
+                o.draw(|gx, gy, cov| {
+                    let (sx, sy) = (b.min.x + gx as f32, b.min.y + gy as f32);
+                    let (sx, sy) = match rotation {
+                        Some((cx, cy)) => (cx - (sy - cy), cy + (sx - cx)),
+                        None => (sx, sy),
+                    };
+                    blend((ox + off + sx) as i32, (oy + off + sy) as i32, cov, col, a * alpha);
+                });
             }
         }
     }
@@ -487,12 +627,264 @@ impl Default for ExportOptions {
     }
 }
 
+/// The `app.export` params that are not export options: which photos, where to, a preset to start
+/// from, and the desktop app's background flag.
+pub const TARGET_PARAMS: &[&str] = &["id", "ids", "path", "dir", "preset", "background"];
+
+/// The export option params [`ExportOptions::from_json`] reads (and [`ExportOptions::to_json`] writes).
+pub const OPTION_PARAMS: &[&str] = &[
+    "format",
+    "quality",
+    "resize",
+    "longEdge",
+    "shortEdge",
+    "width",
+    "height",
+    "megapixels",
+    "percent",
+    "dontEnlarge",
+    "ppi",
+    "limitKb",
+    "sharpen",
+    "sharpenAmount",
+    "naming",
+    "startNumber",
+    "subfolder",
+    "conflict",
+    "tiffCompression",
+    "dngCompression",
+    "metadata",
+    "removeLocation",
+    "watermark",
+    "colorSpace",
+    "bitDepth",
+];
+
+/// The keys of a `watermark` object ([`Watermark`], camelCase).
+pub const WATERMARK_PARAMS: &[&str] = &["text", "vertical", "size", "opacity", "anchor", "inset", "color", "shadow", "image", "imageWidth"];
+
+/// Text height as a fraction of the short edge: the range the renderer draws without clamping.
+pub const WATERMARK_SIZE_RANGE: (f32, f32) = (0.005, 0.5);
+/// Margin as a fraction of the short edge.
+pub const WATERMARK_INSET_RANGE: (f32, f32) = (0.0, 0.4);
+/// A graphic's width as a fraction of the photo's width.
+pub const WATERMARK_IMAGE_WIDTH_RANGE: (f32, f32) = (0.01, 1.0);
+
+/// Levenshtein distance, for "did you mean" on a misspelled key (both inputs are short).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev.get(j).copied().unwrap_or(0) + usize::from(ca != cb);
+            let del = prev.get(j + 1).copied().unwrap_or(0) + 1;
+            let ins = cur.get(j).copied().unwrap_or(0) + 1;
+            if let Some(c) = cur.get_mut(j + 1) {
+                *c = sub.min(del).min(ins);
+            }
+        }
+        prev = cur;
+    }
+    prev.last().copied().unwrap_or(0)
+}
+
+/// `unknown parameter \`k\``, naming the closest known key when one is near.
+fn unknown_key(what: &str, k: &str, known: &[&str]) -> String {
+    let near = known.iter().map(|n| (edit_distance(&k.to_ascii_lowercase(), &n.to_ascii_lowercase()), *n)).filter(|(d, _)| *d <= 2).min();
+    match near {
+        Some((_, n)) => format!("unknown {what} `{k}` (did you mean `{n}`?)"),
+        None => format!("unknown {what} `{k}` (one of {})", known.join(", ")),
+    }
+}
+
+/// A JSON integer (`92`; never `92.5` or `"92"`), as [`ExportOptions::from_json`] reads them.
+fn whole(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64()
+}
+
 impl ExportOptions {
+    /// Stored export settings (a saved preset, `prefs.json ▸ lastExport`) with the keys an older or
+    /// newer version may have written and this one doesn't know dropped, also inside `watermark`.
+    /// [`ExportOptions::validate`] is strict about what a caller types; settings saved on disk are
+    /// not the caller's typo, and refusing them would make a preset or Export with Previous fail
+    /// for good after an update.
+    pub fn known_keys_only(p: &serde_json::Value) -> serde_json::Value {
+        let mut p = p.clone();
+        if let Some(o) = p.as_object_mut() {
+            o.retain(|k, _| OPTION_PARAMS.contains(&k.as_str()) || TARGET_PARAMS.contains(&k.as_str()));
+            if let Some(w) = o.get_mut("watermark").and_then(serde_json::Value::as_object_mut) {
+                w.retain(|k, _| WATERMARK_PARAMS.contains(&k.as_str()));
+            }
+        }
+        p
+    }
+
+    /// Strict [`ExportOptions::from_json`] for a command that is about to export (issue #181): an
+    /// unknown parameter or a value that cannot be read as what it is for is an error, never a
+    /// silent default. `app.export` targets (`id`, `ids`, `path`, `dir`, `preset`, `background`)
+    /// are accepted and left to the caller.
+    pub fn from_params(p: &serde_json::Value) -> crate::Result<Self> {
+        Self::validate("app.export", p)?;
+        Ok(Self::from_json(p))
+    }
+
+    /// Check `app.export` params for `cmd` (the command named in the error): every key must be an
+    /// export option ([`OPTION_PARAMS`]) or a target ([`TARGET_PARAMS`]), every value must be the
+    /// kind of thing its key takes, and a `watermark` object must hold only [`WATERMARK_PARAMS`]
+    /// with its sizes in range (issue #183). `null` means "not given", as a dropped key does.
+    pub fn validate(cmd: &str, p: &serde_json::Value) -> crate::Result<()> {
+        use serde_json::Value;
+        let bad = |msg: String| crate::cmd::bad(cmd, msg);
+        let Some(obj) = p.as_object() else { return Err(bad("params must be an object".into())) };
+        let known: Vec<&str> = OPTION_PARAMS.iter().chain(TARGET_PARAMS).copied().collect();
+        let int = |k: &str, v: &Value, lo: i64, hi: i64| -> crate::Result<i64> {
+            whole(v).filter(|i| (lo..=hi).contains(i)).ok_or_else(|| bad(format!("`{k}` must be an integer {lo}..{hi}")))
+        };
+        let num = |k: &str, v: &Value, lo: f64, hi: f64| -> crate::Result<f64> {
+            v.as_f64().filter(|f| f.is_finite() && (lo..=hi).contains(f)).ok_or_else(|| bad(format!("`{k}` must be a number {lo}..{hi}")))
+        };
+        fn string<'a>(cmd: &str, k: &str, v: &'a Value) -> crate::Result<&'a str> {
+            v.as_str().ok_or_else(|| crate::cmd::bad(cmd, format!("`{k}` must be a string")))
+        }
+        let boolean = |k: &str, v: &Value| -> crate::Result<bool> { v.as_bool().ok_or_else(|| bad(format!("`{k}` must be true or false"))) };
+        let one_of = |k: &str, v: &Value, options: &[&str]| -> crate::Result<()> {
+            let s = string(cmd, k, v)?;
+            if options.iter().any(|o| o.eq_ignore_ascii_case(s)) { Ok(()) } else { Err(bad(format!("`{k}` must be one of {}", options.join("|")))) }
+        };
+        for (k, v) in obj {
+            if v.is_null() {
+                continue;
+            }
+            match k.as_str() {
+                "format" => {
+                    if ExportFormat::parse(string(cmd, k, v)?).is_none() {
+                        return Err(bad(format!("`{k}` must be one of jpeg|png|tiff|webp|avif|dng|original")));
+                    }
+                }
+                "quality" => {
+                    int(k, v, 1, 100)?;
+                }
+                "ppi" => {
+                    int(k, v, 1, u16::MAX as i64)?;
+                }
+                "limitKb" => {
+                    int(k, v, 0, u32::MAX as i64)?;
+                }
+                "startNumber" => {
+                    int(k, v, 0, 999_999)?;
+                }
+                "bitDepth" => {
+                    if !matches!(whole(v), Some(8 | 10 | 16 | 32)) {
+                        return Err(bad(format!("`{k}` must be 8, 10, 16 or 32")));
+                    }
+                }
+                "longEdge" | "shortEdge" | "width" | "height" | "megapixels" | "percent" => {
+                    num(k, v, 0.0, 1.0e9)?;
+                }
+                "resize" => {
+                    let Some(r) = v.as_object() else { return Err(bad(format!("`{k}` must be an object {{mode, value, height?, dontEnlarge?}}"))) };
+                    if let Some(x) = r.keys().find(|x| !matches!(x.as_str(), "mode" | "value" | "height" | "dontEnlarge")) {
+                        return Err(bad(unknown_key("resize key", x, &["mode", "value", "height", "dontEnlarge"])));
+                    }
+                    serde_json::from_value::<Resize>(v.clone()).map_err(|e| bad(format!("`{k}`: {e}")))?;
+                }
+                "dontEnlarge" | "removeLocation" | "background" => {
+                    boolean(k, v)?;
+                }
+                "naming" | "subfolder" | "path" | "dir" | "preset" => {
+                    string(cmd, k, v)?;
+                }
+                "sharpen" => one_of(k, v, &["none", "screen", "matte", "glossy"])?,
+                "sharpenAmount" => one_of(k, v, &["low", "standard", "high"])?,
+                "conflict" => one_of(k, v, &["unique", "overwrite", "skip"])?,
+                "tiffCompression" => one_of(k, v, &["none", "lzw", "zip", "deflate"])?,
+                "dngCompression" => {
+                    serde_json::from_value::<DngCompression>(v.clone())
+                        .map_err(|_| bad(format!("`{k}` must be one of lossless|deflate|uncompressed")))?;
+                }
+                "metadata" => one_of(k, v, &["all", "allExceptCamera", "copyright", "none"])?,
+                "colorSpace" => {
+                    if OutputSpace::parse(string(cmd, k, v)?).is_none() {
+                        return Err(bad(format!("`{k}` must be one of srgb|displayP3|adobeRgb|proPhoto|rec2020")));
+                    }
+                }
+                "watermark" => Self::validate_watermark(cmd, v)?,
+                "id" => {
+                    int(k, v, 0, i64::MAX)?;
+                }
+                "ids" => {
+                    let ok = v.as_array().is_some_and(|a| a.iter().all(|x| x.is_u64()));
+                    if !ok {
+                        return Err(bad(format!("`{k}` must be an array of photo ids")));
+                    }
+                }
+                _ => return Err(bad(unknown_key("parameter", k, &known))),
+            }
+        }
+        Ok(())
+    }
+
+    /// A `watermark` value: text, or an object of [`WATERMARK_PARAMS`] (issue #183).
+    fn validate_watermark(cmd: &str, v: &serde_json::Value) -> crate::Result<()> {
+        use serde_json::Value;
+        let bad = |msg: String| crate::cmd::bad(cmd, msg);
+        let obj = match v {
+            Value::String(_) => return Ok(()),
+            Value::Object(o) => o,
+            _ => {
+                return Err(bad(
+                    "`watermark` must be text or an object {text, vertical, size, opacity, anchor, inset, color, shadow, image, imageWidth}".into(),
+                ));
+            }
+        };
+        let frac = |k: &str, v: &Value, (lo, hi): (f32, f32), unit: &str| -> crate::Result<()> {
+            match v.as_f64() {
+                Some(f) if f.is_finite() && (f64::from(lo)..=f64::from(hi)).contains(&f) => Ok(()),
+                _ => Err(bad(format!("`watermark.{k}` must be a number {lo}..{hi} ({unit})"))),
+            }
+        };
+        for (k, v) in obj {
+            if v.is_null() {
+                continue;
+            }
+            match k.as_str() {
+                "text" | "image" => {
+                    v.as_str().ok_or_else(|| bad(format!("`watermark.{k}` must be a string")))?;
+                }
+                "vertical" | "shadow" => {
+                    v.as_bool().ok_or_else(|| bad(format!("`watermark.{k}` must be true or false")))?;
+                }
+                "size" => frac(k, v, WATERMARK_SIZE_RANGE, "fraction of the short edge")?,
+                "opacity" => frac(k, v, (0.0, 1.0), "0 = invisible, 1 = solid")?,
+                "inset" => frac(k, v, WATERMARK_INSET_RANGE, "fraction of the short edge")?,
+                "imageWidth" => frac(k, v, WATERMARK_IMAGE_WIDTH_RANGE, "fraction of the photo's width")?,
+                "anchor" => {
+                    serde_json::from_value::<Anchor>(v.clone()).map_err(|_| {
+                        bad("`watermark.anchor` must be one of topLeft|top|topRight|left|center|right|bottomLeft|bottom|bottomRight".into())
+                    })?;
+                }
+                "color" => {
+                    let ok = v.as_array().is_some_and(|a| a.len() == 3 && a.iter().all(|c| matches!(whole(c), Some(0..=255))));
+                    if !ok {
+                        return Err(bad("`watermark.color` must be [r, g, b] with 0..255 each (sRGB)".into()));
+                    }
+                }
+                _ => return Err(bad(unknown_key("watermark key", k, WATERMARK_PARAMS))),
+            }
+        }
+        serde_json::from_value::<Watermark>(v.clone()).map(|_| ()).map_err(|e| bad(format!("`watermark`: {e}")))
+    }
+
     /// Read options from command params (`format`, `quality`, `limitKb`, `sharpen`, `sharpenAmount`,
     /// `naming`, `metadata`, `removeLocation`, `watermark`, `colorSpace`, `bitDepth`, `ppi`) and the
     /// size: one of `longEdge`, `shortEdge`, `width`, `height` (both = fit inside W × H),
     /// `megapixels`, `percent` (absent or 0 = full size), or a [`Resize`] object as `resize`; plus
     /// `dontEnlarge` (default true).
+    ///
+    /// Lenient: anything unknown or unreadable falls back to the default, which suits stored
+    /// prefs and dialog prefill. A command that is about to export uses
+    /// [`ExportOptions::from_params`], which validates first.
     pub fn from_json(p: &serde_json::Value) -> Self {
         use serde_json::Value;
         let d = Self::default();
@@ -930,6 +1322,8 @@ pub struct PreparedExport {
     pub photo: lightcraft_catalog::PhotoId,
     pub file_name: String,
     work: Work,
+    /// The library's originals, which [`run_batch`] never writes over (shared by a batch).
+    guard: std::sync::Arc<crate::originals::OriginalGuard>,
 }
 
 struct RenderWork {
@@ -952,12 +1346,30 @@ enum Work {
     },
 }
 
-/// Set up the export of photo `id` at 1-based position `seq` of a batch.
+/// Set up the export of photo `id` at 1-based position `seq` of a batch. (For a whole batch use
+/// [`prepare_batch`]: it looks at the library's originals once.)
 pub fn prepare_export(
     session: &mut crate::Session,
     id: lightcraft_catalog::PhotoId,
     o: &ExportOptions,
     seq: usize,
+) -> Result<PreparedExport, String> {
+    let guard = std::sync::Arc::new(session.original_guard());
+    prepare_guarded(session, id, o, seq, guard)
+}
+
+/// [`prepare_export`] for each of `ids` in order (`{seq}` = position, from 1).
+pub fn prepare_batch(session: &mut crate::Session, ids: &[lightcraft_catalog::PhotoId], o: &ExportOptions) -> Result<Vec<PreparedExport>, String> {
+    let guard = std::sync::Arc::new(session.original_guard());
+    ids.iter().enumerate().map(|(i, id)| prepare_guarded(session, *id, o, i + 1, guard.clone())).collect()
+}
+
+fn prepare_guarded(
+    session: &mut crate::Session,
+    id: lightcraft_catalog::PhotoId,
+    o: &ExportOptions,
+    seq: usize,
+    guard: std::sync::Arc<crate::originals::OriginalGuard>,
 ) -> Result<PreparedExport, String> {
     let p = session.catalog.photo(id).ok_or("no such photo")?;
     let file_name = o.file_name_for(p, seq);
@@ -979,7 +1391,7 @@ pub fn prepare_export(
             size: (p.width as usize, p.height as usize),
         }
     };
-    Ok(PreparedExport { photo: id, file_name, work })
+    Ok(PreparedExport { photo: id, file_name, work, guard })
 }
 
 impl PreparedExport {
@@ -1031,14 +1443,16 @@ pub enum DngCompression {
 }
 
 /// The destination of a batch: a folder (with `ExportOptions::subfolder` and the conflict policy
-/// applied), or one exact file path (single photo; overwritten).
+/// applied to each file together with its sidecars), or one exact file path (single photo; an
+/// ordinary file already there is replaced). Either way a catalogued original (or its sidecar)
+/// is never written over: see [`crate::originals`].
 #[derive(Clone, Debug, Default)]
 pub struct Destination {
     pub dir: String,
     pub exact: Option<String>,
 }
 
-/// Export `ids` in order ([`prepare_export`] + [`run_batch`]), stopping at the first error.
+/// Export `ids` in order ([`prepare_batch`] + [`run_batch`]), stopping at the first error.
 pub fn export_batch(
     session: &mut crate::Session,
     ids: &[lightcraft_catalog::PhotoId],
@@ -1047,15 +1461,46 @@ pub fn export_batch(
     write: &mut dyn FnMut(&str, &[u8]) -> Result<(), String>,
     exists: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let items = ids.iter().enumerate().map(|(i, id)| prepare_export(session, *id, o, i + 1)).collect::<Result<Vec<_>, _>>()?;
+    let items = prepare_batch(session, ids, o)?;
     run_batch(items, o, to, write, exists, true, &mut |_, _| true)
 }
 
+/// Write an exported or rendered file on disk: its folder is created if needed, and the file is
+/// replaced atomically ([`lightcraft_catalog::safe_file::write_atomic_nosync`]: a temp file
+/// renamed into place), so a failure part-way leaves any previous file intact and no truncated
+/// one. Not synced to disk (issue #134): an export can always be made again from the original.
+/// The native writer behind exports, renders and screenshots (app, CLI, MCP).
+pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    write_with(path, bytes, false)
+}
+
+/// [`write_file`], synced to disk: for a written file that becomes a library photo (Edit a Copy)
+/// and so can't simply be exported again once the catalog points at it.
+pub fn write_file_durable(path: &str, bytes: &[u8]) -> Result<(), String> {
+    write_with(path, bytes, true)
+}
+
+fn write_with(path: &str, bytes: &[u8], durable: bool) -> Result<(), String> {
+    use lightcraft_catalog::safe_file::{write_atomic, write_atomic_nosync};
+    let p = std::path::Path::new(path);
+    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    if durable { write_atomic(p, bytes) } else { write_atomic_nosync(p, bytes) }.map_err(|e| format!("{path}: {e}"))
+}
+
+/// The path of the sidecar with extension `ext` of the exported file `main`.
+fn sidecar_path(main: &str, ext: &str) -> String {
+    std::path::Path::new(main).with_extension(ext).to_string_lossy().to_string()
+}
+
 /// Run prepared exports in order: pick each one's path, and hand the bytes (and sidecars) to
-/// `write`. `exists` tells whether a path is taken (conflict policy). `progress(done, next file)`
-/// is called before each photo; returning false cancels the rest. Returns one JSON object per
-/// photo: `{path, width, height, bytes, sidecars}`, `{skipped: path}` or (unless
-/// `stop_on_error`) `{photo, file, error}`.
+/// `write`. `exists` tells whether a path is taken. The conflict policy applies to a file and its
+/// sidecars as one: with Unique both get the same free name, with Skip the photo is skipped when
+/// either is taken. A path that is a catalogued original (or its sidecar) is refused whatever the
+/// policy. `progress(done, next file)` is called before each photo; returning false cancels the
+/// rest. Returns one JSON object per photo: `{path, width, height, bytes, sidecars}`,
+/// `{skipped: path}` or (unless `stop_on_error`) `{photo, file, error}`.
 pub fn run_batch(
     items: Vec<PreparedExport>,
     o: &ExportOptions,
@@ -1075,7 +1520,7 @@ pub fn run_batch(
         if !progress(i, &item.file_name) {
             break;
         }
-        let (photo, name) = (item.photo, item.file_name.clone());
+        let (photo, name, guard) = (item.photo, item.file_name.clone(), item.guard.clone());
         let e = match item.run() {
             Ok(e) => e,
             Err(err) if stop_on_error => return Err(err),
@@ -1084,14 +1529,18 @@ pub fn run_batch(
                 continue;
             }
         };
+        // the exported file and its sidecars
+        let group = |main: &str| std::iter::once(main.to_string()).chain(e.sidecars.iter().map(|(x, _)| sidecar_path(main, x))).collect::<Vec<_>>();
         let path = match to.exact.as_deref().filter(|_| single) {
-            Some(p) => p.to_string(),
+            Some(p) => Ok(p.to_string()),
             None => {
-                let mut path = join(&dir, &e.file_name);
-                let busy = |p: &str, taken: &std::collections::HashSet<String>| taken.contains(p) || exists(p);
-                if busy(&path, &taken) {
+                let path = join(&dir, &e.file_name);
+                let busy = |main: &str| group(main).iter().any(|p| taken.contains(p) || exists(p));
+                if !busy(&path) {
+                    Ok(path)
+                } else {
                     match o.conflict {
-                        Conflict::Overwrite => {}
+                        Conflict::Overwrite => Ok(path),
                         Conflict::Skip => {
                             out.push(json!({"skipped": path}));
                             continue;
@@ -1099,29 +1548,34 @@ pub fn run_batch(
                         Conflict::Unique => {
                             let (stem, ext) = e.file_name.rsplit_once('.').map_or((e.file_name.as_str(), None), |(a, b)| (a, Some(b)));
                             let name = |n: usize| join(&dir, &ext.map_or(format!("{stem}-{n}"), |x| format!("{stem}-{n}.{x}")));
-                            path = (2..).map(name).find(|p| !busy(p, &taken)).expect("a free name");
+                            (2..1_000_000).map(name).find(|p| !busy(p)).ok_or_else(|| format!("{path}: no free file name"))
                         }
                     }
                 }
-                path
             }
         };
-        let written = write(&path, &e.bytes).and_then(|()| {
-            let mut sidecars = Vec::new();
-            for (ext, bytes) in &e.sidecars {
-                let sc = std::path::Path::new(&path).with_extension(ext).to_string_lossy().to_string();
-                write(&sc, bytes)?;
-                sidecars.push(sc);
+        let file = path.clone().unwrap_or_else(|_| name.clone());
+        let written = path.and_then(|path| {
+            let files = group(&path);
+            // never over an original, whatever the conflict policy or the exact path said
+            for f in &files {
+                guard.check(std::path::Path::new(f))?;
             }
-            Ok(sidecars)
+            write(&path, &e.bytes)?;
+            let mut sidecars = Vec::new();
+            for ((_, bytes), sc) in e.sidecars.iter().zip(files.iter().skip(1)) {
+                write(sc, bytes)?;
+                sidecars.push(sc.clone());
+            }
+            Ok((path, files, sidecars))
         });
         match written {
-            Ok(sidecars) => {
-                taken.insert(path.clone());
+            Ok((path, files, sidecars)) => {
+                taken.extend(files);
                 out.push(json!({"path": path, "width": e.width, "height": e.height, "bytes": e.bytes.len(), "sidecars": sidecars}));
             }
             Err(err) if stop_on_error => return Err(err),
-            Err(err) => out.push(json!({"photo": photo.0, "file": path, "error": err})),
+            Err(err) => out.push(json!({"photo": photo.0, "file": file, "error": err})),
         }
     }
     Ok(out)
@@ -1225,6 +1679,162 @@ mod tests {
         // string shorthand
         assert_eq!(ExportOptions::from_json(&serde_json::json!({"watermark": "© Me"})).watermark.unwrap().text, "© Me");
         assert!(ExportOptions::from_json(&serde_json::json!({"watermark": ""})).watermark.is_none());
+    }
+
+    fn vertical_japanese() -> Watermark {
+        let options =
+            ExportOptions::from_json(&json!({"watermark": {"text": "日本語", "vertical": true, "size": 0.1, "shadow": false, "opacity": 1.0}}));
+        options.watermark.unwrap()
+    }
+
+    #[test]
+    fn japanese_watermark_options_and_legacy_defaults() {
+        let old = ExportOptions::from_json(&json!({"watermark": {"text": "日本語"}}));
+        assert!(!old.watermark.unwrap().vertical);
+        let wm = vertical_japanese();
+        assert!(wm.vertical);
+        let round: Watermark = serde_json::from_value(serde_json::to_value(&wm).unwrap()).unwrap();
+        assert!(round.vertical);
+    }
+
+    /// Built without craft-fonts, a Japanese watermark still lays out and draws (Inter's
+    /// missing-glyph boxes), and Latin text is unaffected.
+    #[test]
+    fn watermarks_work_without_craft_fonts() {
+        assert_eq!(watermark_fonts(&[]).len(), 1, "Inter only");
+        for wm in [vertical_japanese(), Watermark { text: "LightCraft 日本語".into(), ..Watermark::default() }] {
+            let mut covered = 0usize;
+            watermark_coverage(400, 300, &wm, &[], |_, _, k, _| covered += usize::from(k > 0.0));
+            assert!(covered > 0, "{:?} draws something", wm.text);
+        }
+    }
+
+    #[test]
+    fn biz_ud_vertical_watermarks_place_punctuation_at_the_top_right() {
+        use ab_glyph::Font;
+        let Some(entry) = crate::fonts::CRAFT_FONTS.iter().find(|f| f.family == "BIZ UDMincho") else {
+            eprintln!("skipped: built without BIZ UDMincho from craft-fonts");
+            return;
+        };
+        let font = ab_glyph::FontRef::try_from_slice(entry.bytes).unwrap();
+        // BIZ UDMincho has no Unicode presentation-form characters: the old fallback drew 、。.
+        assert_eq!(font.glyph_id('︑').0, 0);
+        assert_eq!(font.glyph_id('︒').0, 0);
+        let data = harfrust::ShaperData::new(&harfrust::FontRef::new(entry.bytes).unwrap());
+        for ch in ['、', '。'] {
+            let glyph = watermark_cell_glyphs(&font, &data, &ch.to_string(), true, 100.0, 0.0, 0.0).unwrap().remove(0);
+            assert_ne!(glyph.id, font.glyph_id(ch), "the font's vertical alternate for {ch}");
+            let rect = font.outline_glyph(glyph).unwrap().px_bounds();
+            assert!(rect.min.x > 50.0 && rect.max.y < 50.0, "{ch} in the upper right: {rect:?}");
+        }
+        let craft = Box::leak(
+            vec![crate::fonts::CraftFont { family: entry.family, style: entry.style, scripts: entry.scripts, bytes: entry.bytes }].into_boxed_slice(),
+        );
+        let wm = Watermark {
+            text: "、。".into(),
+            vertical: true,
+            size: 0.1,
+            anchor: Anchor::TopLeft,
+            inset: 0.0,
+            shadow: false,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let mut pixels = Vec::new();
+        watermark_coverage(400, 300, &wm, craft, |x, y, k, _| {
+            if k > 0.5 {
+                pixels.push((x, y));
+            }
+        });
+        assert!(!pixels.is_empty());
+        for (x, y) in pixels {
+            assert!(x > 15 && y % 30 < 15, "actual export coverage at the upper right of the 30 px cell: {x}, {y}");
+        }
+    }
+
+    #[test]
+    fn vertical_watermarks_keep_combining_marks_in_one_cell() {
+        let coverage = |text: &str, craft| {
+            let wm = Watermark {
+                text: text.into(),
+                vertical: true,
+                size: 0.1,
+                anchor: Anchor::Center,
+                inset: 0.0,
+                shadow: false,
+                opacity: 1.0,
+                ..Default::default()
+            };
+            let mut pixels = vec![0.0f32; 400 * 300];
+            watermark_coverage(400, 300, &wm, craft, |x, y, k, _| pixels[y * 400 + x] = k);
+            assert!(pixels.iter().any(|&k| k > 0.0));
+            pixels
+        };
+        let compare = |a: &str, b: &str, craft| {
+            let (a_pixels, b_pixels) = (coverage(a, craft), coverage(b, craft));
+            let difference = a_pixels.iter().zip(&b_pixels).position(|(a, b)| a != b);
+            assert!(difference.is_none(), "{a:?} vs {b:?}: first differing pixel {difference:?}");
+        };
+        for (composed, decomposed) in [("éA", "e\u{301}A"), ("Å\nA", "A\u{30a}\nA"), ("A\nB", "A\r\nB"), ("日A", "日\u{e0100}A")] {
+            compare(composed, decomposed, &[]);
+        }
+        if crate::fonts::CRAFT_FONTS.iter().any(|f| f.family == "BIZ UDMincho") {
+            for (composed, decomposed) in [("が日", "か\u{3099}日"), ("ぱ\n日", "は\u{309a}\n日")] {
+                compare(composed, decomposed, crate::fonts::CRAFT_FONTS);
+            }
+        } else {
+            eprintln!("skipped Japanese comparisons: built without BIZ UDMincho from craft-fonts");
+        }
+    }
+
+    #[test]
+    fn upright_watermark_cell_retains_multiple_glyphs() {
+        use ab_glyph::{Font, ScaleFont};
+        let font = ab_glyph::FontRef::try_from_slice(WATERMARK_FONT).unwrap();
+        let data = harfrust::ShaperData::new(&harfrust::FontRef::new(WATERMARK_FONT).unwrap());
+        // There is no precomposed A with a combining long solidus overlay.
+        let glyphs = watermark_cell_glyphs(&font, &data, "A\u{338}", false, 30.0, 0.0, 0.0).unwrap();
+        assert_eq!(glyphs.len(), 2, "retain the base and the separately positioned combining glyph");
+        let baseline = font.as_scaled(30.0).ascent();
+        for glyph in glyphs {
+            assert!((glyph.position.y - baseline).abs() < 1.0, "no extra vertical cell for the mark");
+            assert!(font.outline_glyph(glyph).is_some(), "both glyphs have ink");
+        }
+    }
+
+    #[test]
+    fn japanese_watermarks_support_vertical_columns() {
+        use ab_glyph::Font;
+        let fonts = watermark_fonts(crate::fonts::CRAFT_FONTS);
+        if fonts.len() < 2 {
+            eprintln!("skipped: built without CRAFT_FONTS_DIR, so there is no Japanese watermark face");
+            return;
+        }
+        for c in "日本語の文字".chars() {
+            assert!(fonts[1..].iter().any(|f| f.glyph_id(c).0 != 0), "a craft-fonts face has {c}");
+        }
+        let wm = vertical_japanese();
+        let mut img = Rgba8::new(400, 300);
+        img.data.fill([0, 0, 0, 255]);
+        draw_watermark(&mut img, &wm);
+        let lit: Vec<_> = (0..300).flat_map(|y| (0..400).map(move |x| (x, y))).filter(|&(x, y)| img.get(x, y)[0] > 64).collect();
+        assert!(lit.len() > 100);
+        let w = lit.iter().map(|p| p.0).max().unwrap() - lit.iter().map(|p| p.0).min().unwrap();
+        let h = lit.iter().map(|p| p.1).max().unwrap() - lit.iter().map(|p| p.1).min().unwrap();
+        assert!(h > w * 2, "vertical Japanese must extend down the column");
+        let two = Watermark { text: "日\n本".into(), anchor: Anchor::TopLeft, inset: 0.0, ..wm };
+        img.data.fill([0, 0, 0, 255]);
+        draw_watermark(&mut img, &two);
+        for (text, dx) in [("本", 0), ("日", 30)] {
+            let mut single = Rgba8::new(400, 300);
+            single.data.fill([0, 0, 0, 255]);
+            draw_watermark(&mut single, &Watermark { text: text.into(), ..two.clone() });
+            for y in 0..30 {
+                for x in 0..30 {
+                    assert_eq!(img.get(x + dx, y), single.get(x, y), "newlines move columns left");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1519,5 +2129,100 @@ mod tests {
             Ok(b) => assert_eq!(&b[4..8], b"ftyp"),
             Err(e) => assert!(e.contains("not available"), "{e}"),
         }
+    }
+
+    /// Issue #181: a command about to export refuses what `from_json` would silently default —
+    /// unknown keys (naming the nearest known one) and values of the wrong kind or range.
+    #[test]
+    fn export_params_are_validated() {
+        use serde_json::json;
+        let err = |p: serde_json::Value| ExportOptions::from_params(&p).err().map(|e| e.to_string()).unwrap_or_default();
+        let e = err(json!({"longEdgee": 400}));
+        assert!(e.starts_with("invalid parameters for `app.export`: unknown parameter `longEdgee` (did you mean `longEdge`?)"), "{e}");
+        assert!(err(json!({"qualty": 5})).contains("did you mean `quality`"));
+        assert!(err(json!({"longEdge": "banana"})).contains("`longEdge` must be a number"));
+        assert!(err(json!({"quality": 0})).contains("`quality` must be an integer 1..100"));
+        assert!(err(json!({"quality": "5"})).contains("`quality` must be an integer"));
+        assert!(err(json!({"quality": 92.5})).contains("`quality` must be an integer"));
+        assert!(err(json!({"sharpen": "lots"})).contains("`sharpen` must be one of none|screen|matte|glossy"));
+        assert!(err(json!({"format": "bmp"})).contains("`format` must be one of"));
+        assert!(err(json!({"bitDepth": 12})).contains("`bitDepth` must be 8, 10, 16 or 32"));
+        assert!(err(json!({"colorSpace": "cmyk"})).contains("`colorSpace` must be one of"));
+        assert!(err(json!({"dontEnlarge": "no"})).contains("`dontEnlarge` must be true or false"));
+        assert!(err(json!({"resize": {"mode": "longEdge", "valeu": 10}})).contains("did you mean `value`"));
+        assert!(err(json!({"resize": {"mode": "diagonal", "value": 10}})).contains("`resize`:"));
+        assert!(err(json!({"ids": [1, "x"]})).contains("`ids` must be an array of photo ids"));
+        assert!(err(json!("jpeg")).contains("params must be an object"));
+        assert!(
+            ExportOptions::validate("export.savePreset", &json!({"qualty": 5}))
+                .unwrap_err()
+                .to_string()
+                .starts_with("invalid parameters for `export.savePreset`")
+        );
+        // everything the presets, the dialog, Export with Previous and `render --opt` send passes
+        for p in builtin_presets() {
+            ExportOptions::from_params(&p.params).unwrap_or_else(|e| panic!("{}: {e}", p.name));
+        }
+        let full = ExportOptions {
+            resize: Some(Resize::default()),
+            limit_kb: Some(500),
+            watermark: Some(Watermark { text: "©".into(), ..Default::default() }),
+            bit_depth: Some(16),
+            ..Default::default()
+        };
+        let mut j = full.to_json();
+        for (k, v) in [
+            ("dir", json!("/tmp/out")),
+            ("background", json!(true)),
+            ("preset", json!("x")),
+            ("ids", json!([1, 2])),
+            ("id", json!(1)),
+            ("path", json!("a.jpg")),
+        ] {
+            j[k] = v;
+        }
+        assert_eq!(ExportOptions::from_params(&j).unwrap(), full);
+        assert_eq!(ExportOptions::from_params(&ExportOptions::default().to_json()).unwrap(), ExportOptions::default());
+        // null is "not given", as a dropped key is
+        ExportOptions::from_params(&json!({"quality": 92, "longEdge": null, "watermark": null})).unwrap();
+    }
+
+    /// Issue #183: the `watermark` object's keys, kinds and ranges are checked (and documented in
+    /// the `app.export` param string), instead of unknown keys passing and sizes clamping silently.
+    #[test]
+    fn watermark_params_are_validated() {
+        use serde_json::json;
+        let err = |w: serde_json::Value| ExportOptions::from_params(&json!({"watermark": w})).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            err(json!(5))
+                .contains("`watermark` must be text or an object {text, vertical, size, opacity, anchor, inset, color, shadow, image, imageWidth}")
+        );
+        assert!(
+            err(json!({"text": "x", "bogus": 1}))
+                .contains("unknown watermark key `bogus` (one of text, vertical, size, opacity, anchor, inset, color, shadow, image, imageWidth)")
+        );
+        assert!(err(json!({"text": "x", "sizee": 0.1})).contains("did you mean `size`"));
+        for size in [json!(3), json!(0.5001), json!(0), json!("big")] {
+            let e = err(json!({"text": "x", "size": size}));
+            assert!(e.contains("`watermark.size` must be a number 0.005..0.5 (fraction of the short edge)"), "{size}: {e}");
+        }
+        assert!(err(json!({"text": "x", "opacity": 1.5})).contains("`watermark.opacity` must be a number 0..1"));
+        assert!(err(json!({"text": "x", "inset": -0.1})).contains("`watermark.inset` must be a number 0..0.4"));
+        assert!(err(json!({"image": "logo.png", "imageWidth": 2})).contains("`watermark.imageWidth` must be a number 0.01..1"));
+        assert!(err(json!({"text": "x", "anchor": "middle"})).contains("`watermark.anchor` must be one of"));
+        assert!(err(json!({"text": "x", "color": [255, 255]})).contains("`watermark.color` must be [r, g, b]"));
+        assert!(err(json!({"text": "x", "color": [255, 255, 256]})).contains("`watermark.color`"));
+        assert!(err(json!({"text": "x", "vertical": "yes"})).contains("`watermark.vertical` must be true or false"));
+        assert!(err(json!({"text": 7})).contains("`watermark.text` must be a string"));
+        // the documented shapes pass and read as before
+        let o = ExportOptions::from_params(&json!({"watermark": "© me"})).unwrap();
+        assert_eq!(o.watermark.map(|w| w.text).as_deref(), Some("© me"));
+        let w = json!({"text": "日本語", "vertical": true, "size": 0.1, "opacity": 0.5, "anchor": "topLeft", "inset": 0.05, "color": [0, 0, 0], "shadow": false, "image": "", "imageWidth": 0.3});
+        let wm = ExportOptions::from_params(&json!({"watermark": w})).unwrap().watermark.unwrap();
+        assert!((wm.size - 0.1).abs() < 1e-6 && wm.vertical && wm.anchor == Anchor::TopLeft && wm.color == [0, 0, 0] && !wm.shadow);
+        assert_eq!(ExportOptions::from_params(&json!({"watermark": {"text": "x", "size": 0.5}})).unwrap().watermark.map(|w| w.size), Some(0.5));
+        // the Export dialog's sliders (1–15 % size, 5–100 % opacity, 2–100 % width) stay inside the accepted ranges
+        assert!(WATERMARK_SIZE_RANGE.0 <= 0.01 && WATERMARK_SIZE_RANGE.1 >= 0.15);
+        assert!(WATERMARK_IMAGE_WIDTH_RANGE.0 <= 0.02 && WATERMARK_IMAGE_WIDTH_RANGE.1 >= 1.0);
     }
 }

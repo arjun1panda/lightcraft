@@ -10,24 +10,28 @@ use serde_json::{Value, json};
 use super::{CommandSpec, bad, cmd, has_active, has_selection};
 use crate::{Result, Session};
 
-/// A free `<stem>.dng` (then `<stem>-2.dng`…) next to `path`.
-fn dng_path(path: &str) -> String {
+/// `<stem>.dng`, then `<stem>-2.dng`, `<stem>-3.dng`… next to `path`.
+fn dng_names(path: &str) -> impl Iterator<Item = std::path::PathBuf> {
     let p = Path::new(path);
-    let dir = p.parent().unwrap_or(Path::new(""));
+    let dir = p.parent().unwrap_or(Path::new("")).to_path_buf();
     let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "photo".into());
-    let mut out = dir.join(format!("{stem}.dng"));
-    let mut n = 2;
-    while out.exists() {
-        out = dir.join(format!("{stem}-{n}.dng"));
-        n += 1;
-    }
-    out.to_string_lossy().to_string()
+    (1u64..).map(move |n| if n == 1 { dir.join(format!("{stem}.dng")) } else { dir.join(format!("{stem}-{n}.dng")) })
 }
 
-/// Write the DNG for raw file `path` (develop settings in `packet`); returns the new path.
-/// An empty `packet` writes no XMP.
+/// Write the DNG for raw file `path` (develop settings in `packet`) next to it under a free name;
+/// returns the new path. An empty `packet` writes no XMP.
+///
+/// The DNG is checked before anyone relies on it (Convert to DNG relinks the photo to it, Copy as
+/// DNG deletes the raw copy): the encoded file must decode to the same raw data, and it is
+/// written to a temp file, synced, read back identical and only then given its name — never
+/// replacing an existing file. On any failure no DNG is left behind and the raw stays in use.
 pub(crate) fn write_dng_for(s: &Session, path: &str, packet: String) -> std::result::Result<String, String> {
-    let bytes = match &s.media.file_bytes {
+    write_dng_with(s.media.file_bytes.as_ref(), path, packet)
+}
+
+/// [`write_dng_for`] without the session (imports convert on a worker thread).
+pub(crate) fn write_dng_with(file_bytes: Option<&crate::merge::ByteReader>, path: &str, packet: String) -> std::result::Result<String, String> {
+    let bytes = match file_bytes {
         Some(r) => r(path)?,
         None => std::fs::read(path).map_err(|e| format!("{path}: {e}"))?,
     };
@@ -35,9 +39,21 @@ pub(crate) fn write_dng_for(s: &Session, path: &str, packet: String) -> std::res
     drop(bytes);
     let dng = lightcraft_raw::write_dng(&raw, &lightcraft_raw::DngWriteOptions { xmp: (!packet.is_empty()).then_some(packet), ..Default::default() })
         .map_err(|e| e.to_string())?;
-    let out = dng_path(path);
-    std::fs::write(&out, dng).map_err(|e| format!("{out}: {e}"))?;
-    Ok(out)
+    let back = lightcraft_raw::decode(&dng).map_err(|e| format!("{path}: the DNG written for it doesn't decode ({e}); the raw is kept"))?;
+    let same = match (&back.data, &raw.data) {
+        (lightcraft_raw::RawData::U16(a), lightcraft_raw::RawData::U16(b)) => a == b,
+        (lightcraft_raw::RawData::F32(a), lightcraft_raw::RawData::F32(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        }
+        _ => false,
+    };
+    if (back.width, back.height, back.cpp) != (raw.width, raw.height, raw.cpp) || !same {
+        return Err(format!("{path}: the DNG written for it doesn't hold the same raw data; the raw is kept"));
+    }
+    drop((raw, back));
+    let out = lightcraft_catalog::safe_file::write_new_unique(&mut dng_names(path), &dng)
+        .map_err(|e| format!("{path}: could not write its DNG ({e}); the raw is kept"))?;
+    Ok(out.to_string_lossy().to_string())
 }
 
 fn convert(s: &mut Session, p: &Value) -> Result<Value> {
@@ -133,7 +149,8 @@ fn edit_external(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let mut written = Vec::new();
     let mut write = |path: &str, bytes: &[u8]| -> std::result::Result<(), String> {
-        std::fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))?;
+        // durable: the TIFF becomes a library photo the external editor then changes
+        crate::export::write_file_durable(path, bytes)?;
         written.push(path.to_string());
         Ok(())
     };
@@ -166,6 +183,33 @@ pub(crate) fn content_op(id: lightcraft_catalog::PhotoId, ph: &lightcraft_catalo
     })
 }
 
+/// Ops that fill a photo's empty camera fields (camera, lens, exposure, GPS, capture time) from a fresh probe.
+fn fill_missing_meta(id: lightcraft_catalog::PhotoId, ph: &lightcraft_catalog::Photo, info: &crate::media::ProbeInfo) -> Vec<Op> {
+    let (mut m, src) = (ph.meta.clone(), &info.meta);
+    let before = m.clone();
+    if m.camera.is_empty() {
+        m.camera = src.camera.clone();
+    }
+    if m.lens.is_empty() {
+        m.lens = src.lens.clone();
+    }
+    if m.shutter.is_empty() {
+        m.shutter = src.shutter.clone();
+    }
+    m.focal_mm = m.focal_mm.or(src.focal_mm);
+    m.aperture = m.aperture.or(src.aperture);
+    m.iso = m.iso.or(src.iso);
+    m.gps = m.gps.or(src.gps);
+    let mut ops = Vec::new();
+    if m != before {
+        ops.push(Op::SetMeta { id, meta: Box::new(m) });
+    }
+    if ph.captured.is_none() && info.captured.is_some() {
+        ops.push(Op::SetCaptured { id, captured: info.captured.clone() });
+    }
+    ops
+}
+
 /// Re-read photos whose files changed on disk (an external editor saved them): new size,
 /// dimensions and content hash, cached sources dropped. → {reloaded: [ids]}
 fn reload(s: &mut Session, p: &Value) -> Result<Value> {
@@ -182,8 +226,18 @@ fn reload(s: &mut Session, p: &Value) -> Result<Value> {
     let mut reloaded = Vec::new();
     for ((id, _), info) in paths.into_iter().zip(probed) {
         let (Ok(info), Some(ph)) = (info, s.catalog.photo(id)) else { continue };
-        let Some(op) = content_op(id, ph, info.clone()) else { continue };
+        // camera fields the catalog lacks (e.g. a raw imported before its format was read) are filled in;
+        // nothing already set is overwritten
+        let meta_ops = fill_missing_meta(id, ph, &info);
+        let Some(op) = content_op(id, ph, info.clone()) else {
+            if !meta_ops.is_empty() {
+                ops.extend(meta_ops);
+                reloaded.push(id);
+            }
+            continue;
+        };
         ops.push(op);
+        ops.extend(meta_ops);
         // virtual copies share the file
         for c in s.catalog.photos().filter(|c| c.copy_of == Some(id)) {
             ops.extend(content_op(c.id, c, info.clone()));
@@ -260,9 +314,9 @@ pub fn edit_specs() -> Vec<CommandSpec> {
         cmd!(
             "photo.reload",
             "Reload from Disk",
-            [],
+            ["Photo"],
             None,
-            "{ids?} — re-read photos whose files changed on disk (e.g. saved by an external editor), or raws shown from their embedded preview that can be decoded now → {reloaded}",
+            "{ids?} — re-read photos whose files changed on disk (e.g. saved by an external editor), or raws shown from their embedded preview that can be decoded now; camera fields the catalog lacks are filled in → {reloaded}",
             has_selection,
             reload
         ),
@@ -276,4 +330,33 @@ pub fn edit_specs() -> Vec<CommandSpec> {
             edit_external
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lightcraft_catalog::{Photo, PhotoId, Source};
+
+    /// Reload fills camera fields a photo lacks (a CR3 imported before CR3 metadata was read) and keeps
+    /// everything already set.
+    #[test]
+    fn reload_fills_only_missing_camera_fields() {
+        let mut ph = Photo::new(PhotoId(1), Source::File { path: "/x.cr3".into() }, "x.cr3", "CR3", 1620, 1080, "2026-10-06T00:00:00");
+        ph.meta.title = "Mine".into();
+        ph.meta.iso = Some(800);
+        let mut info = crate::media::ProbeInfo { captured: Some("2026-10-04T08:16:11".into()), ..Default::default() };
+        info.meta.camera = "Canon EOS R6 Mark III".into();
+        info.meta.lens = "RF24-105mm".into();
+        info.meta.iso = Some(400);
+        info.meta.aperture = Some(6.3);
+        let ops = fill_missing_meta(PhotoId(1), &ph, &info);
+        let Some(Op::SetMeta { meta, .. }) = ops.first() else { panic!("{ops:?}") };
+        assert_eq!((meta.camera.as_str(), meta.lens.as_str(), meta.aperture), ("Canon EOS R6 Mark III", "RF24-105mm", Some(6.3)));
+        assert_eq!((meta.title.as_str(), meta.iso), ("Mine", Some(800)), "set fields are kept");
+        assert!(matches!(ops.get(1), Some(Op::SetCaptured { captured: Some(_), .. })));
+        // nothing missing → nothing to do
+        ph.meta = (**meta).clone();
+        ph.captured = Some("2026-10-04T08:16:11".into());
+        assert!(fill_missing_meta(PhotoId(1), &ph, &info).is_empty());
+    }
 }

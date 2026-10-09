@@ -56,6 +56,9 @@ pub(crate) enum Fault {
     Corrupt,
     /// Removing the source fails (as on a read-only card).
     FailRemove,
+    /// Each copy takes a little longer and notes the thread it ran on ([`copy_threads`]), to see
+    /// an import's copies run side by side.
+    Slow,
 }
 
 #[cfg(test)]
@@ -67,6 +70,21 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn inject(f: Fault) {
     FAULT.with(|c| c.set(f));
+}
+
+/// The calling thread's injected fault (tests only), for the workers it starts to inherit.
+#[cfg(test)]
+pub(crate) fn injected_fault() -> Fault {
+    FAULT.with(|c| c.get())
+}
+
+/// The threads copies made under [`Fault::Slow`] ran on (tests only).
+#[cfg(test)]
+static COPY_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn copy_threads() -> Vec<std::thread::ThreadId> {
+    COPY_THREADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 fn injected(f: Fault) -> bool {
@@ -169,6 +187,33 @@ pub(crate) fn place(src: &Path, dir: &Path, name: &str) -> Result<Placed, String
     Ok(placed)
 }
 
+/// Import → **Copy**: copy `src` into `dir` as `name` (-1, -2… when taken) with the same checks as
+/// a move's copy — a new file (never overwriting one, even one that appears meanwhile), synced to
+/// disk and verified; a bad copy is removed and reported, so a card is never wiped on the strength
+/// of it. Returns the new path.
+///
+/// `expect` is the content hash the import's probe computed from its full read of the source
+/// ([`lightcraft_preview::hash_bytes`]): the copy is read back and checked against it, which spares
+/// a third read of the card (issue #134). It also catches a source that changed since the probe
+/// (whose recorded metadata and hash would be stale). Without one the copy is compared byte for
+/// byte with the source.
+pub(crate) fn copy_new(src: &Path, dir: &Path, name: &str, expect: Option<lightcraft_preview::Hash128>) -> Result<PathBuf, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for i in 0..100_000u32 {
+        let d = if i == 0 { dir.join(name) } else { dir.join(format!("{stem}-{i}{ext}")) };
+        match copy_verified(src, &d, expect) {
+            Ok(()) => return Ok(d),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("copy {}: {e} (nothing was imported from it; the original is untouched)", src.display())),
+        }
+    }
+    Err(format!("copy {}: no free name in {}", src.display(), dir.display()))
+}
+
 /// Undo a [`place`]: remove what it created at the destination (the sources were never touched).
 pub(crate) fn rollback(p: &Placed) {
     for sc in p.sidecars.iter().filter(|s| s.created) {
@@ -213,7 +258,7 @@ pub(crate) fn finish(p: &Placed) -> Result<Vec<(String, String)>, String> {
 }
 
 /// A photo (by extension) still beside a stem-named sidecar, sharing its stem.
-fn sibling_photo(sidecar: &Path) -> Option<String> {
+pub(crate) fn sibling_photo(sidecar: &Path) -> Option<String> {
     let dir = sidecar.parent()?;
     let stem = sidecar.file_stem()?.to_string_lossy().to_string();
     fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find_map(|f| {
@@ -241,12 +286,14 @@ fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
             Err(_) => {}
         }
     }
-    copy_verified(src, dst)
+    // Move keeps the byte-for-byte comparison: the source is deleted on the strength of it
+    copy_verified(src, dst, None)
 }
 
-/// Copy into a new file, sync it to disk and compare it with the original; on any failure the
-/// partial copy is removed.
-fn copy_verified(src: &Path, dst: &Path) -> io::Result<()> {
+/// Copy into a new file, sync it to disk and verify it: against `expect` (the probe's hash of the
+/// source) when given, else byte for byte against the source. On any failure the partial copy is
+/// removed.
+pub(crate) fn copy_verified(src: &Path, dst: &Path, expect: Option<lightcraft_preview::Hash128>) -> io::Result<()> {
     let mut out = OpenOptions::new().write(true).create_new(true).open(dst)?;
     let r = (|| {
         let mut inp = File::open(src)?;
@@ -255,6 +302,11 @@ fn copy_verified(src: &Path, dst: &Path) -> io::Result<()> {
             return Err(io::Error::other("write failed (injected)"));
         }
         io::copy(&mut inp, &mut out)?;
+        #[cfg(test)]
+        if injected(Fault::Slow) {
+            COPY_THREADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(std::thread::current().id());
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
         if injected(Fault::Corrupt) {
             out.write_all(b"!")?;
         }
@@ -262,16 +314,34 @@ fn copy_verified(src: &Path, dst: &Path) -> io::Result<()> {
         if let Ok(m) = fs::metadata(src).and_then(|m| m.modified()) {
             let _ = out.set_modified(m);
         }
-        if !same_bytes(src, dst)? {
-            return Err(io::Error::other("the copy differs from the original"));
+        match expect {
+            Some(h) if hash_file(dst)? != h => {
+                Err(io::Error::other("the copy differs from the original as it was read for the import (a bad copy, or the file changed meanwhile)"))
+            }
+            Some(_) => Ok(()),
+            None if !same_bytes(src, dst)? => Err(io::Error::other("the copy differs from the original")),
+            None => Ok(()),
         }
-        Ok(())
     })();
     drop(out);
     if r.is_err() {
         let _ = fs::remove_file(dst);
     }
     r
+}
+
+/// [`lightcraft_preview::hash_bytes`] of a file's content, read in chunks.
+fn hash_file(path: &Path) -> io::Result<lightcraft_preview::Hash128> {
+    let mut f = File::open(path)?;
+    let mut h = lightcraft_preview::Hasher128::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = fill(&mut f, &mut buf)?;
+        if n == 0 {
+            return Ok(h.finish());
+        }
+        h.update(buf.get(..n).unwrap_or(&[]));
+    }
 }
 
 /// Do two files hold the same bytes?

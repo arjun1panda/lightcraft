@@ -7,11 +7,62 @@ use crate::LightcraftApp;
 use crate::state::Dialog;
 use crate::theme::Tokens;
 
+/// Rows the Rename dialog previews.
+const RENAME_PREVIEW_ROWS: usize = 6;
+
+/// The Rename dialog's preview: its first rows (`None` while being planned) and how many files
+/// are renamed. Which names are taken is checked on disk, which can block on a slow drive, so the
+/// rows are planned on a worker thread, and only when the template, start number, photos or
+/// catalog change — never once per frame.
+pub(crate) fn rename_preview(
+    app: &mut LightcraftApp,
+    ctx: &egui::Context,
+    template: &str,
+    start: usize,
+) -> (Option<Vec<lightcraft_engine::rename::RenamePlan>>, usize) {
+    use std::hash::{Hash, Hasher};
+    type Rows = std::sync::Arc<std::sync::Mutex<Option<Vec<lightcraft_engine::rename::RenamePlan>>>>;
+    let ids = app.session.targets(&json!({}));
+    let photos = lightcraft_engine::rename::rename_photos(&app.session.catalog, &ids);
+    let total = photos.len();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (template, start, app.session.catalog.revision, &ids).hash(&mut h);
+    let key = h.finish();
+    let id = egui::Id::new("rename-preview-rows");
+    let read = |rows: &Rows| rows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if let Some((k, rows)) = ctx.data(|d| d.get_temp::<(u64, Rows)>(id))
+        && k == key
+    {
+        return (read(&rows), total);
+    }
+    let rows: Rows = Default::default();
+    let first: Vec<_> = photos.into_iter().take(RENAME_PREVIEW_ROWS).collect();
+    let (out, template, repaint) = (rows.clone(), template.to_string(), ctx.clone());
+    let exists = app.session.media.availability.probe();
+    let work = move || {
+        let plans = lightcraft_engine::rename::plan_rename_photos(&first, &template, start, &|f| exists(f));
+        *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(plans);
+        repaint.request_repaint();
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(e) = std::thread::Builder::new().name("lc-rename-preview".into()).spawn(work) {
+        log::warn!("rename preview: {e}");
+    }
+    #[cfg(target_arch = "wasm32")]
+    work();
+    ctx.data_mut(|d| d.insert_temp(id, (key, rows.clone())));
+    (read(&rows), total)
+}
+
+/// About dialog tabs: (widget id suffix, label). The credits come from `crate::credits`.
+pub const ABOUT_TABS: &[(&str, &str)] = &[("about", "About"), ("contributors", "Contributors"), ("models", "Models")];
+
 /// Help ▸ What's New (docs/whats-new.md).
 pub const WHATS_NEW: &str = include_str!("../../../../docs/whats-new.md");
 
 pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
     let Some(mut dlg) = app.ui.dialog.clone() else { return };
+    let at_start = dlg.clone();
     let t = Tokens::get(ctx);
     let screen = ctx.content_rect();
     // The backdrop is an area below the dialog window (a bare `Middle` layer painter would be
@@ -35,6 +86,9 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         Dialog::NewSmartAlbum { .. } => "Create Smart Album",
         Dialog::AllMetadata { .. } => "All Metadata",
         Dialog::SystemInfo { .. } => "System Info",
+        Dialog::DenoiseModel { .. } => "AI Denoise Model",
+        Dialog::FaceModel { info, .. } if info["download"].is_string() => "Download Face Model",
+        Dialog::FaceModel { .. } => "Add Face Model",
         Dialog::WhatsNew => "What's New",
         Dialog::Cull { .. } => "Assisted Culling",
         Dialog::SmartRules { id: None, .. } => "New Smart Album",
@@ -47,27 +101,40 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         Dialog::Merge { opts } => opts.title(),
         Dialog::Settings { .. } => "Settings",
         Dialog::ConfirmDelete { .. } => "Delete Photos",
+        Dialog::RemoveFolder { disk: true, .. } => "Remove Disk from Library",
+        Dialog::RemoveFolder { .. } => "Remove Folder from Library",
+        // (nothing to download from in this build: the dialog explains the manual install)
+        Dialog::SamModel { .. } if sam_by_hand(&app.session.segmenter) => "Install the SAM 3 Model",
+        Dialog::SamModel { .. } => "Download the SAM 3 Model?",
         Dialog::About => "About LightCraft",
         Dialog::Shortcuts => "Keyboard Shortcuts",
     }
     .to_string();
     let frame = egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::symmetric(16, 12));
-    let shown = egui::Window::new(title)
+    // The import review can be resized (its photo grid takes the room); it keeps a window id of its
+    // own so the size it is given doesn't carry over to the other dialogs. Its content scrolls
+    // rather than growing the window when the options below the grid get taller (e.g. Copy).
+    let import = matches!(dlg, Dialog::Import { .. });
+    let window_id = egui::Id::new(if import { "lightcraft-import-dialog" } else { "lightcraft-dialog" });
+    let shown = egui::Window::new(crate::i18n::tr(&title)).id(window_id)
         .collapsible(false)
-        .resizable(false)
+        .resizable(import)
+        .vscroll(import)
+        .resize(|r| if import { r.default_height(crate::import::DIALOG_SIZE[1]) } else { r })
         .frame(frame)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .default_width(match dlg {
-            Dialog::Import { .. } => 760.0,
+            Dialog::Import { .. } => crate::import::DIALOG_SIZE[0],
             Dialog::SmartRules { .. } => 680.0,
             Dialog::AllMetadata { .. } => 620.0,
+            Dialog::FaceModel { .. } => 460.0,
             _ => 380.0,
         })
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             match &mut dlg {
                 Dialog::AutoStack { gap } => {
-                    ui.label(egui::RichText::new("Stack photos taken within this time of each other:").color(t.text_label));
+                    ui.label(egui::RichText::new(crate::i18n::tr("Stack photos taken within this time of each other:")).color(t.text_label));
                     ui.add(
                         egui::Slider::new(gap, 0.0..=86400.0)
                             .logarithmic(true)
@@ -78,20 +145,20 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     let preview = app.session.execute("stack.auto", &json!({"gap": *gap, "preview": true})).unwrap_or_default();
                     let scope = if app.session.selection.ids.len() > 1 { "the selected photos" } else { "the photos in view" };
                     ui.label(
-                        egui::RichText::new(format!("Creates {} stacks from {} of {scope}", preview["stacks"], preview["photos"])).color(t.text_dim),
+                        egui::RichText::new(crate::i18n::tr_format!("Creates {} stacks from {} of {scope}", preview["stacks"], preview["photos"], scope = crate::i18n::tr(scope))).color(t.text_dim),
                     );
                 }
                 Dialog::Cull { reject_below, pick_best } => {
                     let n = app.session.selection.ids.len();
-                    let scope = if n > 1 { format!("the {n} selected photos") } else { format!("the {} photos in view", app.session.visible_cloned().len()) };
-                    ui.label(egui::RichText::new(format!("Scores {scope} for focus and exposure and finds similar shots taken within seconds of each other (bursts).")).color(t.text_label));
+                    let scope = if n > 1 { crate::i18n::tr_format!("the {n} selected photos", n = n) } else { crate::i18n::tr_format!("the {} photos in view", app.session.visible_cloned().len()) };
+                    ui.label(egui::RichText::new(crate::i18n::tr_format!("Scores {scope} for focus and exposure and finds similar shots taken within seconds of each other (bursts).", scope = scope)).color(t.text_label));
                     ui.add_space(6.0);
-                    let r = ui.add(egui::Slider::new(reject_below, 0.0..=80.0).text("Reject below focus").step_by(1.0));
+                    let r = ui.add(egui::Slider::new(reject_below, 0.0..=80.0).text(crate::i18n::tr("Reject below focus")).step_by(1.0));
                     crate::widgets::register(ui.ctx(), "field:cullReject", r.rect);
-                    ui.label(egui::RichText::new(if *reject_below > 0.0 { "Blurry photos below the score are flagged as rejects." } else { "0: nothing is rejected." }).color(t.text_dim));
-                    let r = ui.checkbox(pick_best, "Pick the sharpest photo of each burst");
+                    ui.label(egui::RichText::new(crate::i18n::tr(if *reject_below > 0.0 { "Blurry photos below the score are flagged as rejects." } else { "0: nothing is rejected." })).color(t.text_dim));
+                    let r = ui.checkbox(pick_best, crate::i18n::tr("Pick the sharpest photo of each burst"));
                     crate::widgets::register(ui.ctx(), "check:cullPick", r.rect);
-                    ui.label(egui::RichText::new("Scores stay on the photos: filter or make smart albums with Focus and Best of Similar Shots.").color(t.text_dim));
+                    ui.label(egui::RichText::new(crate::i18n::tr("Scores stay on the photos: filter or make smart albums with Focus and Best of Similar Shots.")).color(t.text_dim));
                 }
                 Dialog::WhatsNew => {
                     egui::ScrollArea::vertical().max_height(460.0).auto_shrink([false, true]).show(ui, |ui| {
@@ -99,35 +166,37 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                             let l = line.trim_end();
                             if let Some(h) = l.strip_prefix("### ") {
                                 ui.add_space(6.0);
-                                ui.label(egui::RichText::new(h).font(t.semibold(12.5)).color(t.text));
+                                ui.label(egui::RichText::new(crate::i18n::tr(h)).font(t.semibold(12.5)).color(t.text));
                             } else if let Some(h) = l.strip_prefix("## ") {
                                 ui.add_space(8.0);
-                                ui.label(egui::RichText::new(h).font(t.semibold(14.0)).color(t.text));
+                                ui.label(egui::RichText::new(crate::i18n::tr(h)).font(t.semibold(14.0)).color(t.text));
                             } else if l.starts_with("# ") || l.is_empty() {
                             } else if let Some(b) = l.strip_prefix("- ") {
-                                ui.label(egui::RichText::new(format!("•  {}", b.replace('`', ""))).color(t.text_label));
+                                ui.label(egui::RichText::new(format!("•  {}", crate::i18n::tr(b).replace('`', ""))).color(t.text_label));
                             } else {
-                                ui.label(egui::RichText::new(l.trim().replace('`', "")).color(t.text_label));
+                                ui.label(egui::RichText::new(crate::i18n::tr(l.trim()).replace('`', "")).color(t.text_label));
                             }
                         }
                     });
                 }
+                Dialog::DenoiseModel { info, accepted } => crate::panels::denoise::model_dialog(app, ui, &t, info, accepted),
+                Dialog::FaceModel { info, accepted, .. } => crate::panels::faces::model_dialog(app, ui, &t, info, accepted),
                 Dialog::SystemInfo { rows } => {
                     egui::Grid::new("sysinfo").num_columns(2).spacing([16.0, 4.0]).striped(true).show(ui, |ui| {
                         for (k, v) in rows.iter() {
-                            ui.label(egui::RichText::new(k).color(t.text_dim));
+                            ui.label(egui::RichText::new(crate::i18n::tr(k)).color(t.text_dim));
                             ui.add(egui::Label::new(egui::RichText::new(v).color(t.text_label)).wrap());
                             ui.end_row();
                         }
                     });
-                    if ui.button("Copy to Clipboard").clicked() {
+                    if ui.button(crate::i18n::tr("Copy to Clipboard")).clicked() {
                         let text: String = rows.iter().map(|(k, v)| format!("{k}: {v}\n")).collect();
                         ui.ctx().copy_text(text);
                     }
                 }
                 Dialog::AllMetadata { title, rows, search } => {
                     ui.label(egui::RichText::new(title.as_str()).color(t.text_label));
-                    let r = ui.add(egui::TextEdit::singleline(search).hint_text("Filter fields").desired_width(f32::INFINITY));
+                    let r = ui.add(egui::TextEdit::singleline(search).hint_text(crate::i18n::tr("Filter fields")).desired_width(f32::INFINITY));
                     crate::widgets::register(ui.ctx(), "field:metadataSearch", r.rect);
                     let q = search.trim().to_lowercase();
                     let keep = |n: &str, v: &str| q.is_empty() || n.to_lowercase().contains(&q) || v.to_lowercase().contains(&q);
@@ -154,7 +223,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     }
                     egui::ScrollArea::vertical().max_height(440.0).auto_shrink([false, true]).show(ui, |ui| {
                         if groups.is_empty() {
-                            ui.label(egui::RichText::new(rows["note"].as_str().unwrap_or("No metadata found")).color(t.text_dim));
+                            ui.label(egui::RichText::new(crate::i18n::tr(rows["note"].as_str().unwrap_or("No metadata found"))).color(t.text_dim));
                         }
                         for (g, list) in &groups {
                             ui.add_space(6.0);
@@ -169,36 +238,38 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         }
                     });
                 }
-                Dialog::SmartRules { name, rules, .. } => {
-                    let r = ui.add(egui::TextEdit::singleline(name).hint_text("Name").desired_width(f32::INFINITY));
+                Dialog::SmartRules { id, name, rules, .. } => {
+                    let r = ui.add(egui::TextEdit::singleline(name).hint_text(crate::i18n::tr("Name")).desired_width(f32::INFINITY));
                     crate::widgets::register(ui.ctx(), "field:smartName", r.rect);
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
                         crate::panels::rules_editor::edit(ui, rules, "rules", 0);
                     });
                     let problems = rules.problems();
-                    let f = lightcraft_catalog::Filter { rule_set: Some(rules.clone()), ..Default::default() };
+                    // the folder an album made from a folder view carries is not in the editor, but it counts
+                    let folder = id.and_then(|id| app.session.catalog.album(lightcraft_catalog::AlbumId(id))).and_then(|a| a.smart.as_deref().and_then(|f| f.library_folder.clone()));
+                    let f = lightcraft_catalog::Filter { rule_set: Some(rules.clone()), library_folder: folder, ..Default::default() };
                     let n = if problems.is_empty() { app.session.catalog.query(&f, &Default::default()).len() } else { 0 };
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(match problems.first() {
                             Some(p) => p.clone(),
-                            None => format!("{n} photo{} match · updates automatically as photos change", if n == 1 { "" } else { "s" }),
+                            None => crate::i18n::tr_format!("{n} photo{} match · updates automatically as photos change", if n == 1 { "" } else { "s" }, n = n),
                         })
                         .color(t.text_dim),
                     );
                 }
-                Dialog::NewSmartAlbum { name } => {
-                    let r = ui.add(egui::TextEdit::singleline(name).hint_text("Name").desired_width(f32::INFINITY));
+                Dialog::NewSmartAlbum { name, .. } => {
+                    let r = ui.add(egui::TextEdit::singleline(name).hint_text(crate::i18n::tr("Name")).desired_width(f32::INFINITY));
                     r.request_focus();
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         confirm = true;
                     }
                     let rules = app.session.view_rules();
                     let n = app.session.catalog.query(&rules, &Default::default()).len();
-                    ui.label(egui::RichText::new(format!("Matches: {}", rules.describe())).color(t.text_label));
+                    ui.label(egui::RichText::new(crate::i18n::tr_format!("Matches: {}", crate::i18n::filter_label(&rules, &app.session.catalog))).color(t.text_label));
                     ui.label(
-                        egui::RichText::new(format!("{n} photo{} now · updates automatically as photos change", if n == 1 { "" } else { "s" }))
+                        egui::RichText::new(crate::i18n::tr_format!("{n} photo{} now · updates automatically as photos change", if n == 1 { "" } else { "s" }, n = n))
                             .color(t.text_dim),
                     );
                 }
@@ -252,7 +323,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         );
                     }
                     if n > 1 {
-                        ui.label(egui::RichText::new(format!("All {n} selected photos move by the same amount.")).color(t.text_dim));
+                        ui.label(egui::RichText::new(crate::i18n::tr_format!("All {n} selected photos move by the same amount.", n = n)).color(t.text_dim));
                     }
                 }
                 Dialog::LabelNames { names, save_as } => {
@@ -278,21 +349,21 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         });
                     }
                     field(ui, "Save as set", |ui| {
-                        let te = ui.add(egui::TextEdit::singleline(save_as).hint_text("Optional name").desired_width(f32::INFINITY));
+                        let te = ui.add(egui::TextEdit::singleline(save_as).hint_text(crate::i18n::tr("Optional name")).desired_width(f32::INFINITY));
                         crate::widgets::register(ui.ctx(), "field:labelSetName", te.rect);
                     });
                     ui.label(
-                        egui::RichText::new("Names appear in the label menu, the filter bar and the Info panel, and are written to XMP. Empty = the colour's name.")
+                        egui::RichText::new(crate::i18n::tr("Names appear in the label menu, the filter bar and the Info panel, and are written to XMP. Empty = the colour's name."))
                             .color(t.text_dim),
                     );
                 }
                 Dialog::Rename { template, start } => {
                     let n = app.session.targets(&json!({})).len();
-                    ui.label(egui::RichText::new(format!("{n} photo{}", if n == 1 { "" } else { "s" })).color(t.text_dim));
+                    ui.label(egui::RichText::new(crate::i18n::tr_format!("{n} photo{}", if n == 1 { "" } else { "s" }, n = n)).color(t.text_dim));
                     let template_id = egui::Id::new("rename-template");
                     let tags_open = field(ui, "Template", |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let w = (ui.available_width() - 50.0).max(80.0);
+                        let w = crate::import::tag_field_width(ui);
                         let r = ui.add(egui::TextEdit::singleline(template).id(template_id).hint_text("{name}").desired_width(w));
                         crate::widgets::register(ui.ctx(), "field:renameTemplate", r.rect);
                         crate::import::tag_toggle(ui, "renameTemplate")
@@ -313,42 +384,47 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     });
                     field(ui, "Start at", |ui| ui.add(egui::DragValue::new(start).range(0..=999_999)));
                     ui.label(
-                        egui::RichText::new("Tags: see Tags beside the template. Files are renamed on disk (with their XMP sidecars); existing names get -1, -2…")
+                        egui::RichText::new(crate::i18n::tr("Tags: see Tags beside the template. Files are renamed on disk (with their XMP sidecars); existing names get -1, -2…"))
                             .color(t.text_dim),
                     );
-                    let preview = app.session.execute("photo.renamePreview", &json!({"template": template, "start": start})).unwrap_or_default();
-                    egui::Grid::new("rename-preview").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
-                        for pl in preview.as_array().into_iter().flatten().take(6) {
-                            ui.label(egui::RichText::new(pl["from"].as_str().unwrap_or("")).color(t.text_dim));
-                            ui.label(egui::RichText::new("→").color(t.text_dim));
-                            ui.label(egui::RichText::new(pl["to"].as_str().unwrap_or("")).color(t.text));
-                            ui.end_row();
+                    let (preview, total) = rename_preview(app, ui.ctx(), template, *start as usize);
+                    match &preview {
+                        Some(rows) => {
+                            egui::Grid::new("rename-preview").num_columns(3).spacing([8.0, 2.0]).show(ui, |ui| {
+                                for pl in rows {
+                                    ui.label(egui::RichText::new(&pl.from).color(t.text_dim));
+                                    ui.label(egui::RichText::new("→").color(t.text_dim));
+                                    ui.label(egui::RichText::new(&pl.to).color(t.text));
+                                    ui.end_row();
+                                }
+                            });
                         }
-                    });
-                    let more = preview.as_array().map_or(0, Vec::len).saturating_sub(6);
+                        None => {
+                            ui.label(egui::RichText::new(crate::i18n::tr("Checking names…")).color(t.text_dim));
+                        }
+                    }
+                    let more = total.saturating_sub(RENAME_PREVIEW_ROWS);
                     if more > 0 {
-                        ui.label(egui::RichText::new(format!("… and {more} more")).color(t.text_dim));
+                        ui.label(egui::RichText::new(crate::i18n::tr_format!("… and {more} more", more = more)).color(t.text_dim));
                     }
                 }
                 Dialog::RenameKeyword { from, to } => {
                     let n = app.session.catalog.photos().filter(|p| p.meta.keywords.iter().any(|k| lightcraft_catalog::keywords::is_under(k, from))).count();
-                    let r = ui.add(egui::TextEdit::singleline(to).hint_text("New name").desired_width(f32::INFINITY));
+                    let r = ui.add(egui::TextEdit::singleline(to).hint_text(crate::i18n::tr("New name")).desired_width(f32::INFINITY));
                     crate::widgets::register(ui.ctx(), "field:keywordName", r.rect);
                     r.request_focus();
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         confirm = true;
                     }
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Renames “{from}” on {n} photo{} (keywords below it too). Use | for levels, e.g. Travel|Italy. An existing name merges the two.",
-                            if n == 1 { "" } else { "s" }
-                        ))
+                        egui::RichText::new(crate::i18n::tr_format!("Renames “{from}” on {n} photo{} (keywords below it too). Use | for levels, e.g. Travel|Italy. An existing name merges the two.",
+                            if n == 1 { "" } else { "s" }, from = from, n = n))
                         .color(t.text_dim),
                     );
                 }
                 Dialog::MergeKeywords { from, into } => {
-                    ui.label(egui::RichText::new(format!("Replace {} with:", from.iter().map(|f| format!("“{f}”")).collect::<Vec<_>>().join(", "))).color(t.text_label));
-                    let r = ui.add(egui::TextEdit::singleline(into).hint_text("Keyword").desired_width(f32::INFINITY));
+                    ui.label(egui::RichText::new(crate::i18n::tr_format!("Replace {} with:", from.iter().map(|f| format!("“{f}”")).collect::<Vec<_>>().join(", "))).color(t.text_label));
+                    let r = ui.add(egui::TextEdit::singleline(into).hint_text(crate::i18n::tr("Keyword")).desired_width(f32::INFINITY));
                     crate::widgets::register(ui.ctx(), "field:keywordInto", r.rect);
                     r.request_focus();
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -370,30 +446,30 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     });
                 }
                 Dialog::TextPrompt { value, hint, .. } => {
-                    let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint.as_str()).desired_width(f32::INFINITY));
+                    let r = ui.add(egui::TextEdit::singleline(value).hint_text(crate::i18n::tr(hint.as_str())).desired_width(f32::INFINITY));
                     r.request_focus();
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         confirm = true;
                     }
                 }
                 Dialog::NewAlbum { name, .. } | Dialog::RenameAlbum { name, .. } => {
-                    let r = ui.add(egui::TextEdit::singleline(name).hint_text("Name").desired_width(f32::INFINITY));
+                    let r = ui.add(egui::TextEdit::singleline(name).hint_text(crate::i18n::tr("Name")).desired_width(f32::INFINITY));
                     r.request_focus();
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         confirm = true;
                     }
                 }
                 Dialog::CreatePreset { name, group, groups } => {
-                    ui.add(egui::TextEdit::singleline(name).hint_text("Preset name").desired_width(f32::INFINITY));
-                    ui.add(egui::TextEdit::singleline(group).hint_text("Group").desired_width(f32::INFINITY));
-                    ui.label(egui::RichText::new("Settings to include").color(t.text_dim));
+                    ui.add(egui::TextEdit::singleline(name).hint_text(crate::i18n::tr("Preset name")).desired_width(f32::INFINITY));
+                    ui.add(egui::TextEdit::singleline(group).hint_text(crate::i18n::tr("Group")).desired_width(f32::INFINITY));
+                    ui.label(egui::RichText::new(crate::i18n::tr("Settings to include")).color(t.text_dim));
                     group_checklist(ui, "presetInclude", groups);
                 }
                 Dialog::CopySettings { groups } => group_checklist(ui, "copyGroup", groups),
                 Dialog::PasteSettings { groups } => {
                     let n = app.session.targets(&json!({})).len();
                     ui.label(
-                        egui::RichText::new(format!("Paste into {n} photo{} — only settings that were copied are pasted", if n == 1 { "" } else { "s" }))
+                        egui::RichText::new(crate::i18n::tr_format!("Paste into {n} photo{} — only settings that were copied are pasted", if n == 1 { "" } else { "s" }, n = n))
                             .color(t.text_dim),
                     );
                     group_checklist(ui, "pasteGroup", groups);
@@ -401,18 +477,18 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                 Dialog::Export { opts, full_size, resize, preset_name, limit_kb, dir } => {
                     use lightcraft_engine::export::{Anchor as P, ExportFormat as F, MetadataPolicy as M, SharpenAmount as A, SharpenFor as S};
                     let n = app.session.selection.ids.len().max(1);
-                    ui.label(egui::RichText::new(format!("{n} photo{}", if n == 1 { "" } else { "s" })).color(t.text_dim));
+                    ui.label(egui::RichText::new(crate::i18n::tr_format!("{n} photo{}", if n == 1 { "" } else { "s" }, n = n)).color(t.text_dim));
                     // Preset: load a built-in or saved set of options into the dialog
                     field(ui, "Preset", |ui| {
                         let mut chosen = None;
-                        let c = egui::ComboBox::from_id_salt("exportPreset").width(220.0).selected_text("Choose…").show_ui(ui, |ui| {
+                        let c = egui::ComboBox::from_id_salt("exportPreset").width(220.0).selected_text(crate::i18n::tr("Choose…")).show_ui(ui, |ui| {
                             let mut builtin = true;
                             for (p, b) in app.session.all_export_presets() {
                                 if builtin && !b {
                                     ui.separator();
                                 }
                                 builtin = b;
-                                if ui.selectable_label(false, &p.name).clicked() {
+                                if ui.selectable_label(false, crate::i18n::builtin_label(&p.name, b)).clicked() {
                                     chosen = Some(p.name);
                                 }
                             }
@@ -434,7 +510,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         ui,
                         "Format",
                         "exportFormat",
-                        &[(F::Jpeg, "JPEG"), (F::Png, "PNG"), (F::Tiff, "TIFF"), (F::Webp, "WebP"), (F::Avif, "AVIF"), (F::Dng, "DNG"), (F::Original, "Original")],
+                        &[(F::Jpeg, "JPEG"), (F::Png, "PNG"), (F::Tiff, "TIFF"), (F::Webp, "WebP"), (F::Avif, "AVIF"), (F::Dng, "DNG"), (F::Original, "Original files")],
                         &mut opts.format,
                     );
                     if !opts.format.is_rendered() {
@@ -458,7 +534,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     }
                     if !rendered {
                     } else if opts.format == F::Avif {
-                        ui.label(egui::RichText::new("Color space: sRGB (AVIF)").color(t.text_dim));
+                        ui.label(egui::RichText::new(crate::i18n::tr("Color space: sRGB (AVIF)")).color(t.text_dim));
                     } else {
                         use lightcraft_engine::export::OutputSpace as C;
                         choices(
@@ -517,10 +593,10 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         &mut opts.metadata,
                     );
                     if !matches!(opts.metadata, M::None | M::Copyright) {
-                        ui.checkbox(&mut opts.remove_location, "Remove location info");
+                        ui.checkbox(&mut opts.remove_location, crate::i18n::tr("Remove location info"));
                     }
                     let mut wm_on = opts.watermark.is_some();
-                    if ui.checkbox(&mut wm_on, "Watermark").changed() {
+                    if ui.checkbox(&mut wm_on, crate::i18n::tr("Watermark")).changed() {
                         opts.watermark = wm_on.then(|| lightcraft_engine::export::Watermark { text: "© ".into(), ..Default::default() });
                     }
                     if let Some(wm) = &mut opts.watermark {
@@ -538,7 +614,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                             field(ui, "Graphic", |ui| {
                                 trailing_button_row(ui, |ui| {
                                     if app.services.pick_files.is_some()
-                                        && crate::widgets::text_button(ui, "exportWmChoose", "Choose…", false).clicked()
+                                        && crate::widgets::text_button(ui, "exportWmChoose", crate::i18n::tr("Choose…"), false).clicked()
                                         && let Some(f) = app.services.pick_files.as_mut().and_then(|pick| pick().into_iter().next())
                                     {
                                         wm.image = f;
@@ -551,8 +627,9 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                                 wm.image_width = (width / 100.0) as f32;
                             }
                         } else {
+                            choices(ui, app.ui.language.tr("Text direction"), "exportWmOrientation", &[(false, app.ui.language.tr("Horizontal text")), (true, app.ui.language.tr("Vertical text"))], &mut wm.vertical);
                             field(ui, "Text", |ui| {
-                                ui.add(egui::TextEdit::singleline(&mut wm.text).hint_text("© Your Name").desired_width(f32::INFINITY))
+                                ui.add(egui::TextEdit::multiline(&mut wm.text).desired_rows(2).hint_text(crate::i18n::tr("© Your Name")).desired_width(f32::INFINITY))
                             });
                         }
                         choices(
@@ -571,7 +648,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                             wm.opacity = (op / 100.0) as f32;
                         }
                         if !graphic {
-                            ui.checkbox(&mut wm.shadow, "Shadow");
+                            ui.checkbox(&mut wm.shadow, crate::i18n::tr("Shadow"));
                         }
                     }
                     }
@@ -587,7 +664,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     let naming_id = egui::Id::new("export-naming");
                     let tags_open = field(ui, "File name", |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let w = (ui.available_width() - 50.0).max(80.0);
+                        let w = crate::import::tag_field_width(ui);
                         ui.add(egui::TextEdit::singleline(&mut opts.naming).id(naming_id).hint_text("{name}-{seq}  ·  {date}  ·  {title}  ·  {folder}").desired_width(w));
                         crate::import::tag_toggle(ui, "exportNaming")
                     });
@@ -604,7 +681,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     field(ui, "Folder", |ui| {
                         trailing_button_row(ui, |ui| {
                             if app.services.pick_folder.is_some()
-                                && crate::widgets::text_button(ui, "exportChooseFolder", "Choose…", false).clicked()
+                                && crate::widgets::text_button(ui, "exportChooseFolder", crate::i18n::tr("Choose…"), false).clicked()
                                 && let Some(pick) = app.services.pick_folder.as_mut()
                                 && let Some(d) = pick()
                             {
@@ -614,7 +691,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         });
                     });
                     field(ui, "Subfolder", |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut opts.subfolder).hint_text("none").desired_width(f32::INFINITY))
+                        ui.add(egui::TextEdit::singleline(&mut opts.subfolder).hint_text(crate::i18n::tr("none")).desired_width(f32::INFINITY))
                     });
                     use lightcraft_engine::export::Conflict as K;
                     choices(
@@ -628,108 +705,140 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     field(ui, "Save preset", |ui| {
                         trailing_button_row(ui, |ui| {
                             let named = !preset_name.trim().is_empty();
-                            if crate::widgets::text_button(ui, "exportSavePreset", "Save", false).clicked() && named {
+                            if crate::widgets::text_button(ui, "exportSavePreset", crate::i18n::tr("Save"), false).clicked() && named {
                                 let params = export_dialog_params(opts, *full_size, resize, *limit_kb);
                                 match app.run("export.savePreset", json!({"name": preset_name.trim(), "params": params})) {
                                     Ok(_) => {
-                                        app.toast(ui.ctx(), format!("Saved export preset “{}”", preset_name.trim()));
+                                        app.toast(ui.ctx(), crate::i18n::tr_format!("Saved export preset “{}”", preset_name.trim()));
                                         preset_name.clear();
                                     }
                                     Err(e) => app.toast(ui.ctx(), e),
                                 }
                             }
-                            ui.add(egui::TextEdit::singleline(preset_name).hint_text("Preset name").desired_width(ui.available_width()));
+                            ui.add(egui::TextEdit::singleline(preset_name).hint_text(crate::i18n::tr("Preset name")).desired_width(ui.available_width()));
                         });
                     });
                 }
                 Dialog::Merge { opts } => crate::merge::body(app, ui, opts),
                 Dialog::Import { opts } => crate::import::body(app, ui, opts),
                 Dialog::Settings { tab } => crate::panels::settings::body(app, ui, tab),
+                Dialog::SamModel { error, .. } => sam_model_body(app, ui, error.as_deref()),
                 Dialog::ConfirmDelete { count } => {
-                    let what = if *count == 1 { "this photo".to_string() } else { format!("these {count} photos") };
-                    ui.label(format!("Move {what} to Recently Deleted?"));
-                    ui.label(egui::RichText::new("They can be restored from Recently Deleted until it is emptied.").color(t.text_dim));
+                    let what = if *count == 1 { crate::i18n::tr("this photo").to_string() } else { crate::i18n::tr_format!("these {count} photos", count = count) };
+                    ui.label(crate::i18n::tr_format!("Move {what} to Recently Deleted?", what = what));
+                    ui.label(egui::RichText::new(crate::i18n::tr("They can be restored from Recently Deleted until it is emptied.")).color(t.text_dim));
+                }
+                Dialog::RemoveFolder { name, count, path, disk } => {
+                    ui.label(crate::i18n::tr_format!(
+                        "Remove “{name}” and its {count} photo{} from the library?",
+                        if *count == 1 { "" } else { "s" },
+                        name = name,
+                        count = count
+                    ));
+                    ui.label(egui::RichText::new(path.as_str()).color(t.text_dim));
+                    let scope = if *disk { "All the photos imported from this disk are included." } else { "That includes the photos in the folders inside it." };
+                    ui.label(egui::RichText::new(crate::i18n::tr(scope)).color(t.text_dim));
+                    ui.label(
+                        egui::RichText::new(crate::i18n::tr("They move to Recently Deleted and can be restored; no file on disk is touched."))
+                            .color(t.text_dim),
+                    );
                 }
                 Dialog::About => {
-                    ui.label(egui::RichText::new("LightCraft").font(t.semibold(20.0)).color(t.text));
-                    ui.label(format!("Version {} — a clean-room, pure-Rust photo library and raw developer.", env!("CARGO_PKG_VERSION")));
-                    ui.label("MIT OR Apache-2.0. Font: Inter (OFL). Icons: original.");
-                    ui.add_space(10.0);
-                    let discord = egui::Button::new(egui::RichText::new("Join the ArtCraft Discord").font(t.semibold(15.0)).color(egui::Color32::WHITE))
-                        .fill(t.accent)
-                        .min_size(egui::vec2(260.0, 34.0));
-                    let r = ui.add(discord).on_hover_text(crate::links::DISCORD);
-                    crate::widgets::register(ui.ctx(), "button:aboutDiscord", r.rect);
-                    if r.clicked() {
-                        let _ = crate::links::open(app, crate::links::DISCORD);
-                    }
-                    ui.add_space(6.0);
-                    for (label, url) in [
-                        ("LightCraft website", crate::links::APP_PAGE),
-                        ("Source code on GitHub", crate::links::GITHUB),
-                        ("ArtCraft — more creative apps", crate::links::WEBSITE),
-                    ] {
-                        let r = ui.link(label).on_hover_text(url);
-                        if r.clicked() {
-                            let _ = crate::links::open(app, url);
+                    ui.set_min_width(680.0);
+                    let tab_id = egui::Id::new("about_tab");
+                    let mut tab = ui.data_mut(|d| d.get_temp::<u8>(tab_id)).unwrap_or(0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for (i, (id, label)) in ABOUT_TABS.iter().enumerate() {
+                            if crate::widgets::text_button(ui, &format!("aboutTab-{id}"), label, usize::from(tab) == i).clicked() {
+                                tab = u8::try_from(i).unwrap_or(0);
+                            }
+                        }
+                    });
+                    ui.data_mut(|d| d.insert_temp(tab_id, tab));
+                    ui.separator();
+                    match tab {
+                        1 => crate::credits::contributors_ui(app, ui),
+                        2 => crate::credits::models_ui(ui),
+                        _ => {
+                            ui.label(egui::RichText::new("LightCraft").font(t.semibold(20.0)).color(t.text));
+                            ui.label(crate::i18n::tr_format!("Version {} — a clean-room, pure-Rust photo library and raw developer.", env!("CARGO_PKG_VERSION")));
+                            ui.label(crate::i18n::tr_format!("MIT OR Apache-2.0. Fonts: {} (OFL). Icons: original.", crate::theme::font_credits()));
+                            ui.add_space(10.0);
+                            let discord = egui::Button::new(egui::RichText::new(crate::i18n::tr("Join the ArtCraft Discord")).font(t.semibold(15.0)).color(egui::Color32::WHITE))
+                                .fill(t.accent)
+                                .min_size(egui::vec2(260.0, 34.0));
+                            let r = ui.add(discord).on_hover_text(crate::links::DISCORD);
+                            crate::widgets::register(ui.ctx(), "button:aboutDiscord", r.rect);
+                            if r.clicked() {
+                                let _ = crate::links::open(app, crate::links::DISCORD);
+                            }
+                            ui.add_space(6.0);
+                            for (label, url) in [
+                                ("LightCraft website", crate::links::APP_PAGE),
+                                ("Source code on GitHub", crate::links::GITHUB),
+                                ("ArtCraft — more creative apps", crate::links::WEBSITE),
+                            ] {
+                                let r = ui.link(crate::i18n::tr(label)).on_hover_text(url);
+                                if r.clicked() {
+                                    let _ = crate::links::open(app, url);
+                                }
+                            }
                         }
                     }
                 }
-                Dialog::Shortcuts => {
-                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                        egui::Grid::new("shortcuts").striped(true).show(ui, |ui| {
-                            for (id, label, sc, _) in crate::menus::UI_COMMANDS {
-                                if let Some(sc) = sc {
-                                    ui.label(*label);
-                                    ui.label(*sc);
-                                    ui.label(egui::RichText::new(*id).color(t.text_dim));
-                                    ui.end_row();
-                                }
-                            }
-                            for c in lightcraft_engine::command_specs() {
-                                if let Some(sc) = c.shortcut {
-                                    ui.label(c.label);
-                                    ui.label(sc);
-                                    ui.label(egui::RichText::new(c.id).color(t.text_dim));
-                                    ui.end_row();
-                                }
-                            }
-                            for (sc, id, _) in crate::shortcuts::ALIASES {
-                                let label = crate::menus::UI_COMMANDS
-                                    .iter()
-                                    .find(|c| c.0 == *id)
-                                    .map(|c| c.1)
-                                    .or_else(|| lightcraft_engine::find_command(id).map(|c| c.label))
-                                    .unwrap_or(id);
-                                ui.label(label);
-                                ui.label(*sc);
-                                ui.label(egui::RichText::new(*id).color(t.text_dim));
-                                ui.end_row();
-                            }
-                        });
-                    });
-                }
+                Dialog::Shortcuts => crate::panels::keymap::body(app, ui, &t),
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let informational = matches!(dlg, Dialog::About | Dialog::Shortcuts | Dialog::Settings { .. });
-                if !informational && ui.button("Cancel").clicked() {
-                    close = true;
+                // a model file LightCraft cannot use has nothing to confirm
+                let unusable_model = matches!(&dlg, Dialog::DenoiseModel { info, .. } | Dialog::FaceModel { info, .. } if info["kind"] == "unsupported");
+                let informational = unusable_model || matches!(dlg, Dialog::About | Dialog::Shortcuts | Dialog::Settings { .. });
+                let sam = &app.session.segmenter;
+                let (sam_installed, sam_running, sam_failed) = (sam.installed(), sam.download_status().running, sam.download_status().error.is_some());
+                // no download location in this build: nothing to offer but the manual install
+                let sam_nowhere = sam_by_hand(sam);
+                let cancel = match &dlg {
+                    Dialog::SamModel { .. } if sam_running || sam_installed || sam_nowhere => "Close",
+                    Dialog::SamModel { .. } => "Not Now",
+                    _ => "Cancel",
+                };
+                if !informational {
+                    let r = ui.button(crate::i18n::tr(cancel));
+                    crate::widgets::register(ui.ctx(), "button:dialogCancel", r.rect);
+                    if r.clicked() {
+                        close = true;
+                    }
                 }
                 let add_label;
                 let ok = match &dlg {
                     Dialog::Import { opts } => {
                         let n = opts.selected_paths().len();
                         let verb = if opts.copy && opts.move_files { "Move" } else { "Import" };
-                        add_label = format!("{verb} {n} Photo{}", if n == 1 { "" } else { "s" });
+                        add_label = crate::i18n::tr_format!("{verb} {n} Photo{}", if n == 1 { "" } else { "s" }, verb = crate::i18n::tr(verb), n = n);
                         add_label.as_str()
                     }
                     Dialog::Merge { .. } => "Merge",
+                    Dialog::DenoiseModel { info, .. } if info["download"].is_string() => "Accept & Download",
+                    Dialog::DenoiseModel { .. } => "Install",
+                    Dialog::FaceModel { info, .. } if !informational && info["download"].is_string() => "Download",
+                    Dialog::FaceModel { .. } if !informational => "Install",
                     Dialog::ConfirmDelete { .. } => "Delete",
+                    Dialog::RemoveFolder { .. } => "Remove",
+                    Dialog::SamModel { then: Some(_), .. } if sam_installed => "Continue",
+                    Dialog::SamModel { .. } if sam_installed || sam_running || sam_nowhere => "",
+                    Dialog::SamModel { error, .. } if error.is_some() || sam_failed => "Try Again",
+                    Dialog::SamModel { .. } => "Download",
                     _ if informational => "Close",
                     _ => "OK",
                 };
-                if ui.button(ok).clicked() {
+                // installing waits for the licence to be accepted
+                let can_confirm = informational || !matches!(&dlg, Dialog::DenoiseModel { accepted: false, .. } | Dialog::FaceModel { accepted: false, .. });
+                let r = (!ok.is_empty()).then(|| ui.add_enabled(can_confirm, egui::Button::new(crate::i18n::tr(ok))));
+                if let Some(r) = &r {
+                    crate::widgets::register(ui.ctx(), "button:dialogOk", r.rect);
+                }
+                if r.is_some_and(|r| r.clicked()) {
                     if informational {
                         close = true;
                     } else {
@@ -737,20 +846,51 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     }
                 }
             });
+            if import {
+                crate::import::note_dialog_bottom(ui);
+            }
         });
     if let Some(w) = shown {
         ctx.move_to_top(w.response.layer_id);
         crate::widgets::register(ctx, "dialog:window", w.response.rect);
     }
+    // (while the shortcuts editor records a key, it takes Esc itself to cancel)
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         close = true;
     }
     if confirm {
         match confirm_dialog(app, &dlg) {
-            // the import review stays open on an error (e.g. an unusable folder template)
-            Err(e) if matches!(dlg, Dialog::Import { .. }) => app.toast(ctx, e),
+            // the import review stays open on an error (e.g. an unusable folder template), and so
+            // does Export (e.g. no folder chosen) so the choices aren't lost
+            Err(e)
+                if matches!(
+                    dlg,
+                    Dialog::Import { .. }
+                        | Dialog::Export { .. }
+                        | Dialog::NewAlbum { .. }
+                        | Dialog::NewSmartAlbum { .. }
+                        | Dialog::SmartRules { .. }
+                ) =>
+            {
+                app.toast(ctx, e)
+            }
+            // the SAM 3 dialog stays open to show the download (or why it can't start)
+            Err(e) if matches!(dlg, Dialog::SamModel { .. }) => {
+                if let Dialog::SamModel { error, .. } = &mut dlg {
+                    *error = Some(e);
+                }
+            }
+            Ok(_) if keeps_open(app, &dlg) => {
+                if let Dialog::SamModel { error, .. } = &mut dlg {
+                    *error = None;
+                }
+            }
             _ => close = true,
         }
+    }
+    // a dialog opened from inside this one (a button in Settings that shows a licence) takes its place
+    if app.ui.dialog.as_ref().is_some_and(|now| *now != at_start) {
+        return;
     }
     app.ui.dialog = if close { None } else { Some(dlg) };
 }
@@ -765,13 +905,136 @@ pub fn fmt_gap(v: f64) -> String {
         60..3600 => format!("{} min {} s", v / 60, v % 60),
         3600..86400 if v.is_multiple_of(3600) => format!("{} h", v / 3600),
         3600..86400 => format!("{} h {} min", v / 3600, v % 3600 / 60),
-        _ => "1 day".into(),
+        _ => crate::i18n::tr("1 day").into(),
     }
+}
+
+/// Whether a dialog stays open after its action succeeded (the SAM 3 dialog while the model
+/// downloads).
+pub fn keeps_open(app: &LightcraftApp, dlg: &Dialog) -> bool {
+    matches!(dlg, Dialog::SamModel { .. }) && !app.session.segmenter.installed()
+}
+
+/// No SAM 3 model, no download running and nowhere to download it from: installing it by hand is
+/// all the dialog can offer.
+fn sam_by_hand(sam: &lightcraft_engine::segment::Segmenter) -> bool {
+    !sam.installed() && !sam.download_status().running && sam.mirrors().is_empty()
+}
+
+/// The model installation guide.
+const SAM_HELP: &str = "https://github.com/storytold/lightcraft/blob/main/docs/ai-masks.md#getting-the-model";
+
+/// Show the SAM 3 model folder in the file manager (created first, so there is something to show).
+fn show_model_folder(app: &mut LightcraftApp, dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let reveal = app.services.reveal.as_mut().ok_or("not available here")?;
+    reveal(&dir.to_string_lossy())
+}
+
+/// The SAM 3 dialog: what the model is, its size and licence, and the download's progress.
+fn sam_model_body(app: &mut LightcraftApp, ui: &mut egui::Ui, error: Option<&str>) {
+    use lightcraft_engine::segment::{LICENSE_NAME, LICENSE_URL, MODEL_BYTES};
+    let t = Tokens::get(ui.ctx());
+    let seg = &app.session.segmenter;
+    let d = seg.download_status();
+    if seg.installed() {
+        ui.label(crate::i18n::tr("The SAM 3 model is installed: Object and Describe masks are ready."));
+        return;
+    }
+    let gb = |b: u64| b as f64 / 1e9;
+    ui.label(crate::i18n::tr(
+        "Object and Describe masks use SAM 3, Meta's segmentation model. It isn't part of LightCraft, and everything else works without it.",
+    ));
+    let dir = seg.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+    ui.label(format!("{} {:.1} GB, {} {dir}", crate::i18n::tr("A one-time download of about"), gb(MODEL_BYTES), crate::i18n::tr("saved in")));
+    ui.label(
+        egui::RichText::new(format!(
+            "{} {LICENSE_NAME} — {}",
+            crate::i18n::tr("Licence:"),
+            crate::i18n::tr("Meta's terms, not LightCraft's. Downloading it means accepting them.")
+        ))
+        .color(t.text_label),
+    );
+    let r = ui.link(crate::i18n::tr("Read the SAM License")).on_hover_text(LICENSE_URL);
+    crate::widgets::register(ui.ctx(), "link:samLicense", r.rect);
+    if r.clicked() {
+        let _ = crate::links::open(app, LICENSE_URL);
+    }
+    let seg = &app.session.segmenter;
+    if d.running {
+        ui.add_space(4.0);
+        let frac = if d.total > 0 { d.done as f64 / d.total as f64 } else { 0.0 };
+        let text = format!("{:.2} / {:.2} GB · {}", gb(d.done), gb(d.total), d.file);
+        let r = ui.add(egui::ProgressBar::new(frac as f32).text(text));
+        crate::widgets::register(ui.ctx(), "progress:samDownload", r.rect);
+        let r = ui.button(crate::i18n::tr("Cancel Download"));
+        crate::widgets::register(ui.ctx(), "button:samCancel", r.rect);
+        if r.clicked() {
+            app.session.segmenter.cancel_download();
+        }
+        ui.label(egui::RichText::new(crate::i18n::tr("You can close this: the download continues, and resumes if interrupted.")).color(t.text_dim));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        return;
+    }
+    if seg.mirrors().is_empty() {
+        // nothing to download from: say how to install it by hand, with the folder and the guide a click away
+        let dir = seg.dir.clone();
+        ui.label(
+            egui::RichText::new(crate::i18n::tr(
+                "This build can't download the model yet. To install it by hand, put model.safetensors, vocab.json and merges.txt from Meta's facebook/sam3 in the folder above: Object and Describe work as soon as they are there.",
+            ))
+            .color(t.text_dim),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if let Some(dir) = dir.filter(|_| app.services.reveal.is_some()) {
+                let r = ui.button(crate::i18n::tr(crate::menus::reveal_label()));
+                crate::widgets::register(ui.ctx(), "button:samFolder", r.rect);
+                if r.clicked()
+                    && let Err(e) = show_model_folder(app, &dir)
+                {
+                    app.toast(ui.ctx(), e);
+                }
+            }
+            let r = ui.link(crate::i18n::tr("How to install the model")).on_hover_text(SAM_HELP);
+            crate::widgets::register(ui.ctx(), "link:samHelp", r.rect);
+            if r.clicked()
+                && let Err(e) = crate::links::open(app, SAM_HELP)
+            {
+                app.toast(ui.ctx(), e);
+            }
+        });
+    }
+    if let Some(e) = error.map(str::to_string).or(d.error) {
+        ui.label(egui::RichText::new(format!("{} {e}", crate::i18n::tr("The download didn't work:"))).color(egui::Color32::from_rgb(230, 90, 80)));
+    }
+}
+
+/// Runs a command that creates an album and asks the Albums tree to open the folders down to it.
+fn created_in(app: &mut LightcraftApp, command: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let r = app.run(command, params)?;
+    app.ui.reveal_album = r.get("id").and_then(serde_json::Value::as_u64);
+    Ok(r)
 }
 
 pub fn confirm_dialog(app: &mut LightcraftApp, dlg: &Dialog) -> Result<serde_json::Value, String> {
     match dlg {
-        Dialog::NewAlbum { name, folder } => app.run("album.create", json!({"name": name, "folder": folder, "addSelected": !folder})),
+        Dialog::SamModel { then, .. } => {
+            if app.session.segmenter.installed() {
+                // installed: start what the user was doing
+                if let Some((kind, op)) = then {
+                    crate::panels::masking::begin_ai(app, kind, op)?;
+                }
+                return Ok(serde_json::Value::Null);
+            }
+            let r = app.run("segment.model.download", json!({"acknowledged": true}));
+            if r.is_ok() {
+                app.ui.sam_downloading = true;
+            }
+            r
+        }
+        Dialog::NewAlbum { name, folder, parent } => {
+            created_in(app, "album.create", json!({"name": name, "folder": folder, "addSelected": !folder, "parent": parent}))
+        }
         Dialog::RenameAlbum { id, name } => app.run("album.rename", json!({"id": id, "name": name})),
         Dialog::TextPrompt { value, command, params, key, .. } => {
             let mut p = params.clone();
@@ -801,6 +1064,8 @@ pub fn confirm_dialog(app: &mut LightcraftApp, dlg: &Dialog) -> Result<serde_jso
         Dialog::RenameKeyword { from, to } => app.run("keyword.rename", json!({"from": from, "to": to})),
         Dialog::MergeKeywords { from, into } => app.run("keyword.merge", json!({"from": from, "into": into})),
         Dialog::AutoStack { gap } => app.run("stack.auto", json!({"gap": gap})),
+        Dialog::DenoiseModel { info, accepted } => crate::panels::denoise::install(app, info, *accepted),
+        Dialog::FaceModel { path, info, accepted } => crate::panels::faces::install(app, path, info, *accepted),
         Dialog::AllMetadata { .. } | Dialog::SystemInfo { .. } | Dialog::WhatsNew => Ok(serde_json::Value::Null),
         Dialog::Cull { reject_below, pick_best } => {
             let mut p = json!({"pickBest": pick_best});
@@ -809,7 +1074,7 @@ pub fn confirm_dialog(app: &mut LightcraftApp, dlg: &Dialog) -> Result<serde_jso
             }
             app.run("photo.analyze", p)
         }
-        Dialog::SmartRules { id, name, rules } => {
+        Dialog::SmartRules { id, name, rules, parent } => {
             let name = if name.trim().is_empty() { "Smart Album".to_string() } else { name.trim().to_string() };
             match id {
                 Some(id) => {
@@ -818,10 +1083,12 @@ pub fn confirm_dialog(app: &mut LightcraftApp, dlg: &Dialog) -> Result<serde_jso
                     }
                     app.run("album.setRules", json!({"id": id, "replace": true, "rules": {"ruleSet": rules}}))
                 }
-                None => app.run("album.createSmart", json!({"name": name, "rules": {"ruleSet": rules}})),
+                None => created_in(app, "album.createSmart", json!({"name": name, "rules": {"ruleSet": rules}, "parent": parent})),
             }
         }
-        Dialog::NewSmartAlbum { name } => app.run("album.createSmart", json!({"name": if name.trim().is_empty() { "Smart Album" } else { name }})),
+        Dialog::NewSmartAlbum { name, parent } => {
+            created_in(app, "album.createSmart", json!({"name": if name.trim().is_empty() { "Smart Album" } else { name }, "parent": parent}))
+        }
         Dialog::CreatePreset { name, group, groups } => app.run(
             "preset.create",
             json!({
@@ -841,6 +1108,7 @@ pub fn confirm_dialog(app: &mut LightcraftApp, dlg: &Dialog) -> Result<serde_jso
         Dialog::Merge { opts } => crate::merge::start_final(app, opts),
         Dialog::Import { opts } => crate::import::start(app, opts),
         Dialog::ConfirmDelete { .. } => app.run("photo.delete", json!({})),
+        Dialog::RemoveFolder { path, disk, .. } => app.run("library.removeFolder", json!({"path": path, "disk": disk})),
         Dialog::About | Dialog::Shortcuts | Dialog::Settings { .. } => Ok(serde_json::Value::Null),
     }
 }
@@ -875,7 +1143,7 @@ fn group_checklist(ui: &mut egui::Ui, tag: &str, groups: &mut Vec<String>) {
         for (i, g) in SettingsGroup::ALL.iter().enumerate() {
             let key = key_of(g);
             let mut on = groups.contains(&key);
-            let r = cols[i % 2].checkbox(&mut on, g.label());
+            let r = cols[i % 2].checkbox(&mut on, crate::i18n::tr(g.label()));
             crate::widgets::register(&r.ctx, format!("{tag}:{key}"), r.rect);
             if r.changed() {
                 if on {
@@ -887,12 +1155,12 @@ fn group_checklist(ui: &mut egui::Ui, tag: &str, groups: &mut Vec<String>) {
         }
     });
     ui.horizontal(|ui| {
-        let all = ui.small_button("All");
+        let all = ui.small_button(crate::i18n::tr("All"));
         crate::widgets::register(ui.ctx(), format!("{tag}:all"), all.rect);
         if all.clicked() {
             *groups = SettingsGroup::ALL.iter().map(key_of).collect();
         }
-        let none = ui.small_button("None");
+        let none = ui.small_button(crate::i18n::tr("None"));
         crate::widgets::register(ui.ctx(), format!("{tag}:none"), none.rect);
         if none.clicked() {
             groups.clear();
@@ -928,15 +1196,15 @@ fn export_size(ui: &mut egui::Ui, full: &mut bool, r: &mut lightcraft_engine::ex
         (R::Megapixels, "Megapixels"),
         (R::Percent, "Percentage"),
     ];
-    let r_full = ui.checkbox(full, "Full size");
+    let r_full = ui.checkbox(full, crate::i18n::tr("Full size"));
     crate::widgets::register(ui.ctx(), "check:exportFullSize", r_full.rect);
     if !*full {
         field(ui, "Resize to", |ui| {
             let cur = MODES.iter().find(|m| m.0 == r.mode).map_or("Long Edge", |m| m.1);
             let before = r.mode;
-            let c = egui::ComboBox::from_id_salt("exportResizeMode").width(150.0).selected_text(cur).show_ui(ui, |ui| {
+            let c = egui::ComboBox::from_id_salt("exportResizeMode").width(150.0).selected_text(crate::i18n::tr(cur)).show_ui(ui, |ui| {
                 for (m, l) in MODES {
-                    ui.selectable_value(&mut r.mode, m, l);
+                    ui.selectable_value(&mut r.mode, m, crate::i18n::tr(l));
                 }
             });
             crate::widgets::register(ui.ctx(), "combo:exportResizeMode", c.response.rect);
@@ -969,7 +1237,7 @@ fn export_size(ui: &mut egui::Ui, full: &mut bool, r: &mut lightcraft_engine::ex
                 r.height = h as u32;
             }
         }
-        let c = ui.checkbox(&mut r.dont_enlarge, "Don't enlarge");
+        let c = ui.checkbox(&mut r.dont_enlarge, crate::i18n::tr("Don't enlarge"));
         crate::widgets::register(ui.ctx(), "check:exportDontEnlarge", c.rect);
     }
     let mut p = *ppi as f64;
@@ -998,7 +1266,7 @@ fn field<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(egui::vec2(LABEL_W, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_min_width(LABEL_W);
-            ui.label(egui::RichText::new(label).color(t.text_label));
+            ui.label(egui::RichText::new(crate::i18n::tr(label)).color(t.text_label));
         });
         add(ui)
     })

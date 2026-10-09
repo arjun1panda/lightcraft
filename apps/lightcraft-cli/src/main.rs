@@ -9,7 +9,9 @@
 //! lightcraft-cli synth-merge hdr|panorama -o DIR
 //! lightcraft-cli commands [--json]
 //! lightcraft-cli controls [--json]
+//! lightcraft-cli calibrate [--max N] [--out DIR] FOLDERS/FILES…
 //! ```
+#![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod alloc_release;
@@ -69,6 +71,8 @@ USAGE:
                           per line: {\"method\": \"ui.set\", \"params\": {\"view\": \"detail\"}}.
                           Replies go to stdout. `ui.screenshot` without a path writes -o (then
                           OUT-2.png, OUT-3.png…); `ui.settle {timeoutMs?}` waits for renders.
+                          A failed request (\"ok\": false) does not stop the script, but the exit
+                          status is non-zero when any request failed.
         -o, --output OUT  PNG path (a final screenshot is written here if the script took none)
         --size WxH        window size in points (default 1600x1000)
         --scale S         pixels per point (default 1)
@@ -83,12 +87,37 @@ USAGE:
       Write synthetic merge inputs (procedural scene; bracketed DNGs or overlapping PNG views).
   lightcraft-cli commands [--json]   list every command id with its parameters
   lightcraft-cli controls [--json]   list every develop control id with its range
+  lightcraft-cli calibrate [--max N] [--out DIR] FOLDERS/FILES…
+      Fit a colour profile per camera model from raw files and their embedded camera JPEGs
+      (Sony ARW, Nikon NEF, Fujifilm RAF): up to N files spread over the folders (default 300; 0 = all), pooled per
+      model, written as <model>.json to DIR (default: the profiles folder LightCraft reads,
+      <config>/camera-profiles, or $LIGHTCRAFT_CAMERA_PROFILES). Raws of a profiled model then
+      take their colour from the profile and only their tone from their own JPEG.
   lightcraft-cli --version | --help
 ";
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
+
+/// Why `--library DIR` can't be opened; for a library open in another program, how to work with
+/// that one instead (issue #99).
+/// Print the open library's warnings (an unlockable library, damaged settings files) on stderr:
+/// stdout carries command results / MCP protocol messages only.
+fn library_warnings(session: &mut Session, who: &str) {
+    for w in session.take_library_warnings() {
+        eprintln!("{who}: warning: {w}");
+    }
+}
+
+fn library_error(dir: &str, e: lightcraft_engine::EngineError) -> String {
+    match e {
+        lightcraft_engine::EngineError::LibraryInUse(why) => format!(
+            "{dir}: {why}\nTo work with the library while the app has it open, start the app with `--control PORT` and use `lightcraft-cli mcp --connect 127.0.0.1:PORT`."
+        ),
+        e => format!("{dir}: {e}"),
+    }
+}
 
 fn main() -> ExitCode {
     // `--features dhat-heap`: count allocations; the profile is written when `_heap` drops
@@ -103,6 +132,9 @@ fn main() -> ExitCode {
         dhat::Profiler::builder().file_name(file).build()
     };
     alloc_release::install();
+    // Warnings (a GPU render redone on the CPU, an unknown backend name) on stderr; LIGHTCRAFT_LOG
+    // or RUST_LOG picks another level (#168).
+    lightcraft_engine::logging::install("lightcraft-cli");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
@@ -113,6 +145,7 @@ fn main() -> ExitCode {
         Some("merge") => merge(&args[1..]),
         Some("synth-merge") => synth_merge(&args[1..]),
         Some("controls") => controls(&args[1..]),
+        Some("calibrate") => calibrate(&args[1..]),
         Some("--version" | "-V" | "version") => {
             println!("lightcraft-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -130,6 +163,115 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Raw files below `path` (or `path` itself), skipping hidden and NAS metadata folders.
+fn raw_files(path: &Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+    let is_raw =
+        |p: &Path| p.extension().and_then(|e| e.to_str()).is_some_and(|e| ["arw", "nef", "nrw", "raf"].iter().any(|x| e.eq_ignore_ascii_case(x)));
+    if path.is_file() {
+        if is_raw(path) {
+            out.push(path.to_path_buf());
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else { return };
+    if depth > 32 {
+        return;
+    }
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(['.', '@']) {
+            continue;
+        }
+        raw_files(&entry.path(), out, depth + 1);
+    }
+}
+
+fn calibrate(args: &[String]) -> Result<(), String> {
+    let mut max = 300usize;
+    let mut out: Option<std::path::PathBuf> = None;
+    let mut inputs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max" => max = take_value(args, &mut i, "--max")?.parse().map_err(|_| "--max needs a number".to_string())?,
+            "--out" => out = Some(take_value(args, &mut i, "--out")?.into()),
+            a if a.starts_with("--") => return Err(format!("unknown option `{a}`")),
+            f => inputs.push(f.to_string()),
+        }
+        i += 1;
+    }
+    if inputs.is_empty() {
+        return Err("calibrate needs folders or raw files".into());
+    }
+    let mut files = Vec::new();
+    for input in &inputs {
+        raw_files(Path::new(input), &mut files, 0);
+    }
+    files.sort();
+    files.dedup();
+    let found = files.len();
+    if max > 0 && files.len() > max {
+        // spread over all folders (dates, scenes) rather than the first N
+        files = (0..max).filter_map(|k| files.get(k * found / max).cloned()).collect();
+    }
+    eprintln!("calibrate: {} of {found} raw files", files.len());
+    let dir = out.or_else(lightcraft_engine::camera_profiles::dir).ok_or("no profiles folder: pass --out DIR")?;
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 6);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let pools: Vec<lightcraft_engine::camera_profiles::Pool> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut pool = lightcraft_engine::camera_profiles::Pool::default();
+                    while let Some(path) = files.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        let result = std::fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| pool.add(&bytes));
+                        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        match result {
+                            Ok(Some(model)) => eprintln!("[{n}/{}] {} ({model})", files.len(), path.display()),
+                            Ok(None) => eprintln!("[{n}/{}] {}: skipped (no usable camera JPEG or colour)", files.len(), path.display()),
+                            Err(e) => eprintln!("[{n}/{}] {}: {e}", files.len(), path.display()),
+                        }
+                    }
+                    pool
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    let mut pool = lightcraft_engine::camera_profiles::Pool::default();
+    for p in pools {
+        pool.merge(p);
+    }
+    let mut written = 0;
+    for result in pool.fit(5) {
+        match result {
+            Ok(profile) => {
+                let path = lightcraft_engine::camera_profiles::save(&profile, &dir)?;
+                println!(
+                    "{}: {} photos, {} colour pairs, hue/saturation table {} → {}",
+                    profile.model,
+                    profile.files,
+                    profile.samples,
+                    profile.hue_sat.is_some(),
+                    path.display()
+                );
+                written += 1;
+            }
+            Err(e) => eprintln!("calibrate: {e}"),
+        }
+    }
+    for (model, n) in pool.files() {
+        if n < 5 {
+            eprintln!("calibrate: {model}: only {n} usable photo(s), at least 5 needed");
+        }
+    }
+    if written == 0 {
+        return Err("no profile written".into());
+    }
+    Ok(())
 }
 
 fn mcp(args: &[String]) -> Result<(), String> {
@@ -181,8 +323,9 @@ fn mcp(args: &[String]) -> Result<(), String> {
             let mut h = match &library {
                 Some(dir) => {
                     let mut h = Headless::default();
-                    let r = h.session.open_library(dir, demo).map_err(|e| e.to_string())?;
+                    let r = h.session.open_library(dir, demo).map_err(|e| library_error(dir, e))?;
                     eprintln!("lightcraft-cli mcp: opened library {dir} ({r:?})");
+                    library_warnings(&mut h.session, "lightcraft-cli mcp");
                     h
                 }
                 None if demo => Headless::demo(),
@@ -248,7 +391,7 @@ fn merge(args: &[String]) -> Result<(), String> {
         }
         i += 1;
     }
-    let mut s = Session::new().with_fs();
+    let mut s = Session::new().with_fs().with_default_denoise_models();
     let paths = expand_paths(&files);
     let r = s.execute("library.import", &json!({"paths": paths})).map_err(|e| e.to_string())?;
     let mut ids: Vec<u64> = r["imported"].as_array().map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
@@ -404,39 +547,40 @@ fn run(args: &[String]) -> Result<(), String> {
     if steps.is_empty() {
         return Err("run: no command given (see `lightcraft-cli commands`)".into());
     }
-    let mut backend: Box<dyn Backend> = match connect {
-        Some(addr) => {
-            if demo || library.is_some() || !imports.is_empty() {
-                return Err("--demo, --library and --import apply to headless mode only".into());
-            }
-            Box::new(
-                Remote::connect(&addr)
-                    .map_err(|e| format!("LightCraft is not reachable at {addr} ({e}); start it with `lightcraft --control 7980`"))?,
-            )
-        }
-        None => {
-            let mut h = match &library {
-                Some(dir) => {
-                    let mut h = Headless::default();
-                    h.session.open_library(dir, demo).map_err(|e| e.to_string())?;
-                    h
+    let mut backend: Box<dyn Backend> =
+        match connect {
+            Some(addr) => {
+                if demo || library.is_some() || !imports.is_empty() {
+                    return Err("--demo, --library and --import apply to headless mode only".into());
                 }
-                None if demo => Headless::demo(),
-                None => Headless::default(),
-            };
-            if !imports.is_empty() {
-                let paths = expand_paths(&imports);
-                let r = h.session.execute("library.import", &json!({"paths": paths})).map_err(|e| e.to_string())?;
-                // what follows acts on the imported photos (already-known files are reported as duplicates)
-                let mut ids: Vec<Value> = r["imported"].as_array().cloned().unwrap_or_default();
-                ids.extend(r["duplicates"].as_array().into_iter().flatten().filter_map(|d| d.get("existing").filter(|v| v.is_u64()).cloned()));
-                if let Some(first) = ids.first().cloned() {
-                    h.session.execute("library.select", &json!({"ids": ids, "active": first})).map_err(|e| e.to_string())?;
-                }
+                Box::new(Remote::connect(&addr).map_err(|e| {
+                    format!("LightCraft is not reachable at {addr} ({e}); start it with `lightcraft --control {}`", connect_port(&addr))
+                })?)
             }
-            Box::new(h)
-        }
-    };
+            None => {
+                let mut h = match &library {
+                    Some(dir) => {
+                        let mut h = Headless::default();
+                        h.session.open_library(dir, demo).map_err(|e| library_error(dir, e))?;
+                        library_warnings(&mut h.session, "lightcraft-cli");
+                        h
+                    }
+                    None if demo => Headless::demo(),
+                    None => Headless::default(),
+                };
+                if !imports.is_empty() {
+                    let paths = expand_paths(&imports);
+                    let r = h.session.execute("library.import", &json!({"paths": paths})).map_err(|e| e.to_string())?;
+                    // what follows acts on the imported photos (already-known files are reported as duplicates)
+                    let mut ids: Vec<Value> = r["imported"].as_array().cloned().unwrap_or_default();
+                    ids.extend(r["duplicates"].as_array().into_iter().flatten().filter_map(|d| d.get("existing").filter(|v| v.is_u64()).cloned()));
+                    if let Some(first) = ids.first().cloned() {
+                        h.session.execute("library.select", &json!({"ids": ids, "active": first})).map_err(|e| e.to_string())?;
+                    }
+                }
+                Box::new(h)
+            }
+        };
     let mut out = std::io::stdout().lock();
     let mut failed = 0;
     for s in &steps {
@@ -460,6 +604,12 @@ fn run(args: &[String]) -> Result<(), String> {
 fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str, String> {
     *i += 1;
     args.get(*i).map(String::as_str).ok_or_else(|| format!("{flag} needs a value"))
+}
+
+/// The port an `--connect` address names, for the recovery hint. The whole address when it has
+/// no port, so a hint is never built from a guess.
+fn connect_port(addr: &str) -> &str {
+    addr.rsplit_once(':').map_or(addr, |(_, port)| port)
 }
 
 fn render(args: &[String]) -> Result<(), String> {
@@ -502,7 +652,7 @@ fn render(args: &[String]) -> Result<(), String> {
     }
     let input = input.ok_or("render: missing input file")?;
     let output = output.ok_or("render: missing -o OUTPUT")?;
-    let mut s = Session::new().with_fs();
+    let mut s = Session::new().with_fs().with_default_denoise_models();
     let abs = expand_paths(std::slice::from_ref(&input));
     let r = s.execute("library.import", &json!({"paths": abs})).map_err(|e| e.to_string())?;
     let id = r["imported"][0].as_u64().ok_or_else(|| format!("{input}: not a readable photo"))?;
@@ -525,18 +675,24 @@ fn render(args: &[String]) -> Result<(), String> {
     for (k, v) in opts {
         p[k] = v;
     }
-    let mut o = ExportOptions::from_json(&p);
+    let mut o = ExportOptions::from_params(&p).map_err(|e| e.to_string())?;
     if p.get("format").is_none() {
         let ext = Path::new(&output).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
         o.format = ExportFormat::parse(&ext)
             .ok_or_else(|| format!("{output}: unknown extension (use .jpg .png .tif .webp .avif .dng or --opt format=…)"))?;
     }
     let e = export_photo(&mut s, lightcraft_engine::catalog::PhotoId(id), &o, 1)?;
-    std::fs::write(&output, &e.bytes).map_err(|err| format!("{output}: {err}"))?;
-    for (ext, bytes) in &e.sidecars {
-        let sc = Path::new(&output).with_extension(ext);
-        std::fs::write(&sc, bytes).map_err(|err| format!("{}: {err}", sc.display()))?;
-        eprintln!("lightcraft-cli: wrote {}", sc.display());
+    // never over the input (or its sidecar), however it is spelled: `render IMG.jpg -o IMG.jpg`
+    let sidecars: Vec<(String, &Vec<u8>)> =
+        e.sidecars.iter().map(|(ext, bytes)| (Path::new(&output).with_extension(ext).to_string_lossy().to_string(), bytes)).collect();
+    let guard = s.original_guard();
+    for p in std::iter::once(&output).chain(sidecars.iter().map(|(p, _)| p)) {
+        guard.check(Path::new(p)).map_err(|err| format!("render: {err}"))?;
+    }
+    lightcraft_engine::export::write_file(&output, &e.bytes)?;
+    for (sc, bytes) in &sidecars {
+        lightcraft_engine::export::write_file(sc, bytes)?;
+        eprintln!("lightcraft-cli: wrote {sc}");
     }
     eprintln!("lightcraft-cli: wrote {output} ({}×{})", e.width, e.height);
     Ok(())
@@ -572,19 +728,19 @@ fn snapshot(args: &[String]) -> Result<(), String> {
     if script.is_none() && output.is_none() {
         return Err("snapshot: give -o OUT.png and/or --script FILE".into());
     }
-    if !(scale > 0.0 && size[0] >= 1.0 && size[1] >= 1.0) {
-        return Err("snapshot: bad --size/--scale".into());
-    }
+    lightcraft_ui_egui::headless::viewport_pixels(size, scale).map_err(|e| format!("snapshot: bad --size/--scale: {e}"))?;
     let t0 = Instant::now();
     let mut session = match &library {
         Some(dir) => {
-            let mut s = Session::new().with_fs();
-            s.open_library(dir, false).map_err(|e| format!("{dir}: {e}"))?;
+            let mut s = Session::new().with_fs().with_default_denoise_models().with_default_face_models();
+            s.open_library(dir, false).map_err(|e| library_error(dir, e))?;
             s
         }
-        None if files.is_empty() => Session::with_demo().with_fs(),
-        None => Session::new().with_fs(),
+        None if files.is_empty() => Session::with_demo().with_fs().with_default_denoise_models().with_default_face_models(),
+        None => Session::new().with_fs().with_default_denoise_models().with_default_face_models(),
     };
+    // Apply compute policy before imports or the first scripted query can discover an adapter.
+    session.execute("app.gpu", &json!({"enabled": false})).map_err(|e| e.to_string())?;
     if !files.is_empty() {
         let ti = Instant::now();
         let r = session.execute("library.import", &json!({"paths": expand_paths(&files)})).map_err(|e| e.to_string())?;
@@ -592,24 +748,18 @@ fn snapshot(args: &[String]) -> Result<(), String> {
         eprintln!("lightcraft-cli snapshot: imported {n} files in {:.0} ms", ti.elapsed().as_secs_f64() * 1e3);
     }
     let services = lightcraft_ui_egui::Services {
-        write_shared: Some(std::sync::Arc::new(|p: &str, b: &[u8]| {
-            if let Some(dir) = Path::new(p).parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            }
-            std::fs::write(p, b).map_err(|e| format!("{p}: {e}"))
-        })),
-        write: Some(Box::new(|p: &str, b: &[u8]| {
-            if let Some(dir) = Path::new(p).parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            }
-            std::fs::write(p, b).map_err(|e| format!("{p}: {e}"))
-        })),
+        write_shared: Some(std::sync::Arc::new(lightcraft_engine::export::write_file)),
+        write: Some(Box::new(lightcraft_engine::export::write_file)),
         png: Some(Box::new(|img: &lightcraft_raster::Rgba8| {
             lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(img), &lightcraft_codecs::EncodeMeta::default()).unwrap_or_default()
         })),
         ..Default::default()
     };
-    let app = lightcraft_ui_egui::LightcraftApp::new(session, services);
+    let mut app = lightcraft_ui_egui::LightcraftApp::new(session, services);
+    // Snapshot sessions promise no GPU: disable photo compute as well as the compositor
+    // before the first frame can start background adapter discovery.
+    // This UI state is session-local: the CLI neither loads nor saves desktop ui.json.
+    app.ui.settings.gpu = false;
     let mut h = Headless::new(app, size, scale);
     let timeout = Duration::from_secs(60);
     let mut shots = 0usize;
@@ -625,6 +775,9 @@ fn snapshot(args: &[String]) -> Result<(), String> {
         Some(p.with_file_name(format!("{stem}-{shots}.{ext}")).to_string_lossy().to_string())
     };
     let mut wrote_output = false;
+    // Issue #166: a scripted request that fails still gets its reply printed and the run carries
+    // on (like `run --keep-going`), but the exit status reports it — CI judges by exit status.
+    let mut failed = 0usize;
     if let Some(script) = &script {
         let text = std::fs::read_to_string(script).map_err(|e| format!("{script}: {e}"))?;
         let mut out = std::io::stdout().lock();
@@ -657,6 +810,9 @@ fn snapshot(args: &[String]) -> Result<(), String> {
                 }
                 _ => h.request(&method, params, timeout),
             };
+            if reply["ok"] != true {
+                failed += 1;
+            }
             if let Some(o) = reply.as_object_mut() {
                 o.insert("id".into(), id);
                 // wall time of the request (incl. the frames it ran), and since the start
@@ -693,7 +849,7 @@ fn snapshot(args: &[String]) -> Result<(), String> {
         }
     }
     eprintln!("lightcraft-cli snapshot: done in {:.2} s ({} frames)", t0.elapsed().as_secs_f64(), h.frames());
-    Ok(())
+    if failed > 0 { Err(format!("{failed} scripted request(s) failed")) } else { Ok(()) }
 }
 
 fn commands(args: &[String]) -> Result<(), String> {

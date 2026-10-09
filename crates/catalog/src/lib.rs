@@ -5,15 +5,24 @@
 //!   snapshot — crash-safe and diff-friendly (see [`journal`]);
 //! - **undo/redo**: the engine keeps inverse ops;
 //! - **determinism**: replaying the log reproduces the state exactly (property-tested).
+//!
+//! **Catalog format version** ([`journal::VERSION`], see [`journal`] → *Format versions*): adding
+//! an [`Op`] variant or a serialized field means bumping it. Newer builds read every older format
+//! (and upgrade it on open); older builds refuse a newer library with [`CatalogError::Newer`]
+//! instead of reading part of it.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod dates;
+pub mod folders;
 pub mod journal;
 pub mod keywords;
+pub mod local;
+pub mod lock;
 pub mod model;
 pub mod query;
 pub mod rules;
+pub mod safe_file;
 pub mod stacks;
 pub mod store;
 
@@ -21,11 +30,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use dates::{DateRun, GroupBy};
+pub use folders::FolderNode;
 pub use journal::{Journal, LoadReport, PersistStats, SnapshotPolicy, SnapshotTiming};
 pub use keywords::KeywordNode;
 use lightcraft_develop::DevelopSettings;
+pub use local::{DEFAULT_FORGET_DAYS, ForgetPlan, folder_of};
+pub use lock::{LibraryLock, LockError, LockOwner};
 pub use model::*;
-pub use query::{DateGroup, Filter, RatingOp, Sort, SortKey};
+pub use query::{DateGroup, Filter, Person, RatingOp, Sort, SortKey, mix64};
 pub use rules::{Match, Rule, RuleSet};
 use serde::{Deserialize, Serialize};
 pub use store::{FsStore, MemStore, Store};
@@ -44,6 +56,10 @@ pub enum CatalogError {
     Corrupt(String),
     #[error("catalog storage: {0}")]
     Io(String),
+    /// The library was written by a newer LightCraft (a newer catalog format, or a change this
+    /// version doesn't know). Nothing was read into the session and nothing was modified.
+    #[error("this library was written by a newer version of LightCraft ({0}); update LightCraft to open it. The library was left unchanged.")]
+    Newer(String),
 }
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
@@ -120,6 +136,11 @@ pub enum Op {
         id: AlbumId,
         parent: Option<AlbumId>,
     },
+    /// Where the album stands among its siblings (`None`: by name). Format version 3.
+    SetAlbumOrder {
+        id: AlbumId,
+        order: Option<u32>,
+    },
     SetAlbumPhotos {
         id: AlbumId,
         photos: Vec<PhotoId>,
@@ -190,6 +211,12 @@ pub enum Op {
         label: ColorLabel,
         name: Option<String>,
     },
+    /// When a Local folder was last browsed (ISO 8601; `None` = forget the time). Not an undo
+    /// step: it drives forgetting untouched Local records (see [`local`]).
+    SetBrowsed {
+        folder: String,
+        at: Option<String>,
+    },
     /// Several ops as one step (undo applies the inverses in reverse).
     Batch {
         ops: Vec<Op>,
@@ -209,6 +236,9 @@ pub struct Catalog {
     /// Custom colour label names.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     label_names: BTreeMap<ColorLabel, String>,
+    /// When each Local folder was last browsed (folder path → ISO 8601), see [`local`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    browsed: BTreeMap<String, String>,
     /// Increments on every applied op.
     #[serde(skip)]
     pub revision: u64,
@@ -256,6 +286,28 @@ impl Catalog {
     }
     pub fn albums(&self) -> impl Iterator<Item = &Album> {
         self.albums.values()
+    }
+    /// The albums and folders directly inside `parent` (`None`: the top level), in the order the
+    /// sidebar lists them: folders first, then by their place if the user ordered them (those
+    /// without one after, by name), else by name.
+    pub fn album_children(&self, parent: Option<AlbumId>) -> Vec<&Album> {
+        let mut kids: Vec<&Album> = self.albums.values().filter(|a| a.parent == parent).collect();
+        kids.sort_by_cached_key(|a| album_order_key(a));
+        kids
+    }
+    /// [`Self::album_children`] of every folder (and of the top level, under `None`) in one pass:
+    /// what a tree view that draws all of them wants each frame.
+    pub fn album_children_by_parent(&self) -> std::collections::HashMap<Option<AlbumId>, Vec<&Album>> {
+        let mut map: std::collections::HashMap<Option<AlbumId>, Vec<&Album>> = std::collections::HashMap::new();
+        for a in self.albums.values() {
+            map.entry(a.parent).or_default().push(a);
+        }
+        map.values_mut().for_each(|kids| kids.sort_by_cached_key(|a| album_order_key(a)));
+        map
+    }
+    /// Whether anything inside `parent` has a place of its own (the folder is ordered by hand).
+    pub fn album_children_are_ordered(&self, parent: Option<AlbumId>) -> bool {
+        self.albums.values().any(|a| a.parent == parent && a.order.is_some())
     }
     /// The Quick Collection, once something was added to it.
     pub fn quick_collection(&self) -> Option<AlbumId> {
@@ -454,7 +506,20 @@ impl Catalog {
                     }
                 }
                 let a = self.album_mut(id)?;
-                Op::MoveAlbum { id, parent: std::mem::replace(&mut a.parent, parent) }
+                if a.parent == parent {
+                    return Ok(Op::MoveAlbum { id, parent });
+                }
+                // its place belonged to the old neighbours: the undo gives it back with the folder
+                let old_order = a.order.take();
+                let old_parent = std::mem::replace(&mut a.parent, parent);
+                match old_order {
+                    Some(_) => Op::Batch { ops: vec![Op::MoveAlbum { id, parent: old_parent }, Op::SetAlbumOrder { id, order: old_order }] },
+                    None => Op::MoveAlbum { id, parent: old_parent },
+                }
+            }
+            Op::SetAlbumOrder { id, order } => {
+                let a = self.album_mut(id)?;
+                Op::SetAlbumOrder { id, order: std::mem::replace(&mut a.order, order) }
             }
             Op::SetAlbumPhotos { id, photos } => {
                 let a = self.album_mut(id)?;
@@ -547,6 +612,14 @@ impl Catalog {
                 };
                 Op::SetLabelName { label, name: old }
             }
+            Op::SetBrowsed { folder, at } => {
+                let folder = crate::query::folder_key(&folder);
+                let old = match at {
+                    Some(t) => self.browsed.insert(folder.clone(), t),
+                    None => self.browsed.remove(&folder),
+                };
+                Op::SetBrowsed { folder, at: old }
+            }
             Op::Batch { ops } => {
                 let mut inverses = Vec::with_capacity(ops.len());
                 for op in ops {
@@ -578,6 +651,22 @@ impl Catalog {
             .collect();
         ops.extend(self.remove_from_stacks_ops(&[id]));
         ops.push(Op::RemovePhoto { id });
+        Op::Batch { ops }
+    }
+
+    /// [`Self::delete_permanently_ops`] for several photos at once. One op list built against the
+    /// catalog as it is now: albums lose all of them in one write each, and stacks are shortened
+    /// (or dissolved) once, however many of their photos go.
+    pub fn delete_photos_permanently_ops(&self, ids: &[PhotoId]) -> Op {
+        let gone: std::collections::HashSet<PhotoId> = ids.iter().copied().collect();
+        let mut ops: Vec<Op> = self
+            .albums
+            .values()
+            .filter(|a| a.photos.iter().any(|p| gone.contains(p)))
+            .map(|a| Op::SetAlbumPhotos { id: a.id, photos: a.photos.iter().copied().filter(|p| !gone.contains(p)).collect() })
+            .collect();
+        ops.extend(self.remove_from_stacks_ops(ids));
+        ops.extend(gone.iter().map(|id| Op::RemovePhoto { id: *id }));
         Op::Batch { ops }
     }
 
@@ -619,9 +708,27 @@ impl Catalog {
     }
 }
 
+/// How siblings are listed: folders first, then the ones with a place of their own by it, then by
+/// name; the id settles any tie.
+fn album_order_key(a: &Album) -> (bool, bool, u32, String, AlbumId) {
+    (!a.folder, a.order.is_none(), a.order.unwrap_or(0), a.name.to_lowercase(), a.id)
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_album_order;
+#[cfg(test)]
 mod tests_background;
 #[cfg(test)]
+mod tests_folders;
+#[cfg(test)]
+mod tests_format_version;
+#[cfg(test)]
 mod tests_journal;
+#[cfg(test)]
+mod tests_local;
+#[cfg(test)]
+mod tests_lock;
+#[cfg(test)]
+mod tests_torn_append;

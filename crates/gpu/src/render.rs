@@ -12,7 +12,7 @@ use lightcraft_pipeline::{Plan, RenderRequest, Rendered, SourceInfo, local};
 use lightcraft_raster::resample::Filter;
 use lightcraft_raster::{Histogram, Plane, Rgb32f, Rgba8};
 
-use crate::ctx::{Buf, Gpu, groups1, groups2};
+use crate::ctx::{Buf, FailKind, Gpu, fail, groups1, groups2};
 use crate::params::{Present, finish_block};
 
 /// Device-resident stages of one view, kept next to the CPU [`lightcraft_pipeline::StageCache`]
@@ -128,27 +128,54 @@ impl GpuStages {
 pub(crate) struct Cx<'a> {
     pub gpu: &'a Gpu,
     enc: Option<wgpu::CommandEncoder>,
+    /// Kernel invocations recorded since the last submit.
+    pending: u64,
 }
+
+/// Kernel invocations recorded before a render submits them (under one full-size pass over a
+/// 24 MP export, several passes over a preview): no single submission runs long.
+const FLUSH_INVOCATIONS: u64 = 16 << 20;
+
+/// Pixels per dispatch of the per-pixel stage (the heaviest kernel).
+const BAND_PIXELS: usize = 4 << 20;
 
 impl<'a> Cx<'a> {
     pub fn new(gpu: &'a Gpu) -> Cx<'a> {
-        Cx { gpu, enc: Some(gpu.encoder()) }
+        Cx { gpu, enc: Some(gpu.encoder()), pending: 0 }
     }
 
     /// Record kernel `name` (see [`Gpu::run`]).
     pub fn run(&mut self, name: &str, p: &[u32], bufs: &[Option<&Buf>], groups: [u32; 3]) {
         let enc = self.enc.get_or_insert_with(|| self.gpu.encoder());
         self.gpu.run(enc, name, p, bufs, groups);
+        // every kernel runs 256 invocations per workgroup
+        self.pending += groups.iter().map(|g| *g as u64).product::<u64>() * 256;
+        if self.pending >= FLUSH_INVOCATIONS {
+            self.flush();
+        }
     }
 
     /// Submit what is recorded and read back `len` values of `b`.
     pub fn read<T: bytemuck::Pod>(&mut self, b: &Buf, len: usize) -> Vec<T> {
+        self.pending = 0;
         let enc = self.enc.take().unwrap_or_else(|| self.gpu.encoder());
         self.gpu.finish_and_read(enc, b, len)
     }
 
+    /// Submit what is recorded so far without waiting. Renders submit stage by stage and every
+    /// [`FLUSH_INVOCATIONS`]: long submissions are what GPU watchdogs reset (Windows TDR, the
+    /// i915 hang check; issue #78's iGPU spent seconds on an export recorded as one submission),
+    /// and buffers dropped by earlier work become reusable by later work (lower peak memory).
+    pub fn flush(&mut self) {
+        self.pending = 0;
+        if let Some(enc) = self.enc.take() {
+            self.gpu.submit([enc.finish()]);
+        }
+    }
+
     /// Submit what is recorded and wait for it (profiling only: stage timings).
     pub fn sync(&mut self) {
+        self.pending = 0;
         if let Some(enc) = self.enc.take() {
             self.gpu.submit([enc.finish()]);
         }
@@ -383,6 +410,84 @@ fn warp_params(
     p
 }
 
+/// Output rows per block of [`coverage_mask`]; a block is one mask word (32 px) wide. 16 rows measured
+/// ~20 % faster than 8 at 6000 × 4000 (fewer interval evaluations, few more edge pixels).
+const COVER_ROWS: usize = 16;
+
+/// The largest source (bytes on the device) a view's stages keep uploaded between renders.
+const RETAIN_SOURCE_BYTES: usize = 96 << 20;
+
+/// Big sources uploaded to the shared copy so far (diagnostics and tests).
+static SOURCE_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The one big source (the original a zoom window is cut from) kept on the device for all the
+/// views of the photo: the Before and After windows and every pan share it, instead of each
+/// view's stages holding (or re-uploading) 288 MB of a 24 MP photo. It does not count as a view's
+/// stages; it is released with the buffer pool when the app idles.
+static SHARED_SOURCE: std::sync::Mutex<Option<(std::sync::Weak<Rgb32f>, Arc<Buf>)>> = std::sync::Mutex::new(None);
+
+fn shared_source(src: &Arc<Rgb32f>, upload: impl FnOnce() -> Buf) -> Arc<Buf> {
+    let mut g = SHARED_SOURCE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((weak, buf)) = &*g
+        && weak.upgrade().is_some_and(|s| Arc::ptr_eq(&s, src))
+    {
+        return buf.clone();
+    }
+    // the previous photo's copy goes (on a render thread it is retired with the render's other
+    // buffers, so for a moment both exist)
+    *g = None;
+    SOURCE_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let buf = Arc::new(upload());
+    *g = Some((Arc::downgrade(src), buf.clone()));
+    buf
+}
+
+/// Free the shared big source (see [`shared_source`]).
+pub(crate) fn release_shared_source() {
+    *SHARED_SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Device bytes of the shared big source, 0 when there is none.
+pub(crate) fn shared_source_bytes() -> usize {
+    SHARED_SOURCE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |(_, b)| b.len * 4)
+}
+
+pub(crate) fn source_uploads() -> u64 {
+    SOURCE_UPLOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The reference framing decision ([`Warp::covers`](lightcraft_pipeline::optics::Warp::covers)) for every
+/// output pixel, one bit per pixel, rows padded to 32-bit words. Blocks of 32 × [`COVER_ROWS`] pixels whose
+/// interval bounds place them clearly inside or outside the image are filled at once
+/// ([`Warp::block_coverage`](lightcraft_pipeline::optics::Warp::block_coverage), the same formulas evaluated
+/// with outward-rounded intervals); only blocks near the image edge evaluate each pixel. Same bits as
+/// evaluating every pixel.
+fn coverage_mask(wp: &lightcraft_pipeline::optics::Warp, o2t: &lightcraft_geom::Affine, w: usize, h: usize) -> Vec<u32> {
+    let words = w.div_ceil(32);
+    let mut coverage = vec![0u32; words * h];
+    if words == 0 {
+        return coverage;
+    }
+    lightcraft_raster::par_rows(&mut coverage, words * COVER_ROWS, |band, rows| {
+        let y0 = band * COVER_ROWS;
+        let y1 = y0 + rows.len() / words;
+        for word in 0..words {
+            let (x0, x1) = (word * 32, (word * 32 + 32).min(w));
+            let full = if x1 - x0 == 32 { u32::MAX } else { (1u32 << (x1 - x0)) - 1 };
+            let block = wp.block_coverage(o2t, x0, x1, y0, y1);
+            for (y, row) in (y0..y1).zip(rows.chunks_exact_mut(words)) {
+                let Some(bits) = row.get_mut(word) else { continue };
+                *bits = match block {
+                    Some(true) => full,
+                    Some(false) => 0,
+                    None => (x0..x1).filter(|&x| wp.covers(o2t, x, y)).fold(0, |b, x| b | 1 << (x - x0)),
+                };
+            }
+        }
+    });
+    coverage
+}
+
 /// Resample the source into the output frame (`Frame::sample`). May return the source buffer
 /// itself when the frame is the identity.
 fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>) -> Arc<Buf> {
@@ -395,7 +500,7 @@ fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>
         let out = cx.gpu.buffer(sp.ow * sp.oh * 3);
         let mut p = vec![src.width as u32, src.height as u32, sp.ow as u32, sp.oh as u32];
         p.extend(orient_map(fr.orient, src.width, src.height).map(|v| v as u32));
-        cx.run("orient", &p, &[Some(&src_buf), Some(&out)], groups2(sp.ow, sp.oh, [16, 16]));
+        cx.run("orient", &p, &[Some(&src_buf), Some(&out), None], groups2(sp.ow, sp.oh, [16, 16]));
         Arc::new(out)
     };
     let (base, (bw, bh)) = match sp.prefilter {
@@ -406,7 +511,7 @@ fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>
         let out = cx.gpu.buffer(w * h * 3);
         let mut p = vec![bw as u32, bh as u32, w as u32, h as u32];
         p.extend(affine_bits(xf));
-        cx.run("sample_affine", &p, &[Some(&base), Some(&out)], groups2(w, h, [16, 16]));
+        cx.run("sample_affine", &p, &[Some(&base), Some(&out), None], groups2(w, h, [16, 16]));
         Arc::new(out)
     };
     match (&sp.mode, fr.warp.as_ref()) {
@@ -417,7 +522,10 @@ fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>
         (SampleMode::Warp(o2t), Some(wp)) => {
             let out = cx.gpu.buffer(w * h * 3);
             let p = warp_params(wp, (bw, bh), (w, h), o2t, sp.sx, sp.sy);
-            cx.run("sample_warp", &p, &[Some(&base), Some(&out)], groups2(w, h, [16, 16]));
+            // f32 rounding can cross a source edge. Keep the reference f64
+            // framing decision in a bit mask; color sampling stays on the GPU.
+            let coverage = cx.gpu.upload(&coverage_mask(wp, o2t, w, h));
+            cx.run("sample_warp", &p, &[Some(&base), Some(&out), Some(&coverage)], groups2(w, h, [16, 16]));
             Arc::new(out)
         }
     }
@@ -434,12 +542,13 @@ struct Host {
     log_l: Option<Arc<Plane>>,
 }
 
-fn profiling() -> bool {
+pub(crate) fn profiling() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LIGHTCRAFT_PROFILE").is_some())
 }
 
-/// Render on `gpu`, reusing `stages` (if given). `None` when the render does not fit the device.
+/// Render on `gpu`, reusing `stages` (if given). `None` (or a result the caller discards) when the
+/// render failed: the reason is recorded with [`crate::ctx::fail`].
 pub fn render(
     gpu: &Gpu,
     src: &Arc<Rgb32f>,
@@ -447,20 +556,31 @@ pub fn render(
     s: &DevelopSettings,
     req: &RenderRequest,
     stages: Option<&GpuStages>,
+    fault: Option<crate::Fault>,
 ) -> Option<Rendered> {
     let mut t = profiling().then(std::time::Instant::now);
-    // Under `LIGHTCRAFT_PROFILE` each stage is submitted and waited for, so the timings are real.
-    let lap = |what: &str, t: &mut Option<std::time::Instant>, cx: &mut Cx<'_>| {
-        if let Some(t) = t {
+    // Each stage is submitted on its own; under `LIGHTCRAFT_PROFILE` also waited for, so the
+    // timings are real.
+    let lap = |what: &str, t: &mut Option<std::time::Instant>, cx: &mut Cx<'_>| match t {
+        Some(t) => {
             cx.sync();
             eprintln!("  gpu {what}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             *t = std::time::Instant::now();
         }
+        None => cx.flush(),
     };
     let plan = lightcraft_pipeline::plan(src, info, s, req);
     let (w, h) = (plan.w, plan.h);
     let n = w * h;
+    let _limit = match fault {
+        Some(crate::Fault::Limit(bytes)) => Some(crate::ctx::LimitOverride::new(bytes)),
+        _ => None,
+    };
     if !gpu.fits(n * 3) {
+        fail(
+            FailKind::Limit,
+            format!("{w}×{h} needs {} MiB buffers, over the device's {} MiB storage-buffer limit", (n * 12).div_ceil(1 << 20), gpu.limit() >> 20),
+        );
         return None;
     }
     let s = &*plan.settings;
@@ -474,8 +594,11 @@ pub fn render(
         Some(e) => e.sampled.clone(),
         None if gpu.fits(src.data.len() * 3) => {
             let upload = || gpu.upload(rgb_words(src));
+            // (a source too big for a view's stages to keep is the one shared copy: a window is
+            // cut from the photo's own pixels, and what its stages keep is its own sampled pixels)
             let src_buf = match stages {
-                Some(c) => c.source(src, upload),
+                Some(c) if src.data.len() * 12 <= RETAIN_SOURCE_BYTES => c.source(src, upload),
+                Some(_) => shared_source(src, upload),
                 None => Arc::new(upload()),
             };
             sample(&mut cx, src, src_buf, &plan)
@@ -501,7 +624,11 @@ pub fn render(
         Some(p) if p.key == plan.lin_key => p,
         _ => Planes { key: plan.lin_key, ..Default::default() },
     };
-    let prep = prepare(&mut cx, &lin, &plan, req, &mut planes);
+    let mut prep = prepare(&mut cx, &lin, &plan, req, &mut planes);
+    // a window dehazes with the whole frame's airlight
+    if let Some(a) = plan.fixed_air {
+        prep.air = a;
+    }
     lap("planes", &mut t, &mut cx);
     if let Some(c) = stages {
         c.put(Entry { src: src.clone(), geo: plan.geo, sampled, lin: Some((plan.lin_key, lin.clone())), planes });
@@ -521,23 +648,35 @@ pub fn render(
     };
     let (p, aux) = finish_block(&fp, &terms, &present);
     let aux = gpu.upload(&aux);
-    let out = gpu.buffer(n);
-    cx.run(
-        "main",
-        &p,
-        &[
-            Some(&lin),
-            Some(&prep.log_l),
-            Some(&prep.base),
-            prep.clarity.as_deref(),
-            prep.texture.as_deref(),
-            prep.dark.as_deref(),
-            masks.as_ref(),
-            Some(&aux),
-            Some(&out),
-        ],
-        groups2(w, h, [16, 16]),
-    );
+    // cleared, so that work which never ran cannot pass for an image (see the check below)
+    let out = cx.zeroed(n);
+    if fault == Some(crate::Fault::Validation) {
+        // a dispatch the device rejects (too many workgroups)
+        cx.run("box_h", &[0; 5], &[Some(&aux), Some(&out)], [gpu.device.limits().max_compute_workgroups_per_dimension + 1, 1, 1]);
+    }
+    // in bands of rows: each dispatch (and submission) stays short on a slow GPU
+    let rows = (BAND_PIXELS / w.max(1) / 16 * 16).max(16); // whole workgroups: bands never overlap
+    let y0_at = crate::params::index("Y0").unwrap_or(0);
+    let mut p = p;
+    for y0 in (0..h).step_by(rows).filter(|_| fault != Some(crate::Fault::DropWork)) {
+        p[y0_at] = y0 as u32;
+        cx.run(
+            "main",
+            &p,
+            &[
+                Some(&lin),
+                Some(&prep.log_l),
+                Some(&prep.base),
+                prep.clarity.as_deref(),
+                prep.texture.as_deref(),
+                prep.dark.as_deref(),
+                masks.as_ref(),
+                Some(&aux),
+                Some(&out),
+            ],
+            groups2(w, rows.min(h - y0), [16, 16]),
+        );
+    }
     // the alpha a mask overlay shows: copied out before the readback below submits
     let overlay_mask = req.overlay.mask(s).map(|m| {
         let list = s.masks.iter().filter(|m| m.visible && !m.components.is_empty());
@@ -549,8 +688,28 @@ pub fn render(
     let data: Vec<[u8; 4]> = cx.read(&out, n);
     let image = Rgba8 { width: w, height: h, data };
     lap("finish + readback", &mut t, &mut cx);
-    let histogram = Histogram::of_srgb8(&image);
+    if crate::ctx::failed() {
+        return None;
+    }
+    // The per-pixel kernel writes alpha 255 everywhere and `out` was cleared: a pixel with any
+    // other alpha means work silently did not run (a driver that reset or dropped a submission
+    // without reporting it — issue #78's all-black exports).
+    let unwritten = unwritten(&image.data);
+    if unwritten > 0 {
+        fail(FailKind::Fatal, format!("the GPU returned an incomplete image ({unwritten} of {n} pixels unwritten)"));
+        return None;
+    }
+    let histogram = match plan.keep {
+        Some(k) => Histogram::of_srgb8(&image.crop(k.x, k.y, k.w, k.h)),
+        None => Histogram::of_srgb8(&image),
+    };
     lap("histogram", &mut t, &mut cx);
+    // An entirely black result (upstream work that did not run would give that too): redo it on
+    // the CPU, which costs time only for the rare photo that really is black.
+    if n >= 4096 && [&histogram.r, &histogram.g, &histogram.b].iter().all(|c| c.first() == Some(&histogram.total)) {
+        fail(FailKind::Blank, "the GPU result is entirely black; rendering it on the CPU to be sure".into());
+        return None;
+    }
     let mut image = image;
     let overlay_mask = overlay_mask.map(|r| match r {
         Ok(b) => cx.read_plane(&b, w, h),
@@ -558,11 +717,20 @@ pub fn render(
         Err(m) => {
             let img = host.lin.get_or_insert_with(|| Arc::new(cx.read_rgb(&lin, w, h))).clone();
             let l = host.log_l.get_or_insert_with(|| Arc::new(cx.read_plane(&prep.log_l, w, h))).clone();
-            lightcraft_pipeline::masks::evaluate_one(m, &plan.frame, w, h, &img, &l, s.light.exposure as f32)
+            lightcraft_pipeline::masks::evaluate_one(m, &plan.frame, w, h, &img, &l, s.light.exposure as f32, plan.mattes.as_deref())
         }
     });
     lightcraft_pipeline::visualize::apply(&mut image, req.overlay, &plan, overlay_mask.as_ref());
+    // spots grew the window the render worked on: cut it back to the request
+    if let Some(k) = plan.keep {
+        image = image.crop(k.x, k.y, k.w, k.h);
+    }
     Some(Rendered { image, histogram, deep: None })
+}
+
+/// Pixels whose alpha is not 255 (cheap: no early exit, so it vectorizes).
+fn unwritten(data: &[[u8; 4]]) -> usize {
+    data.chunks(4096).filter(|c| c.iter().fold(255u8, |a, p| a & p[3]) != 255).map(|c| c.iter().filter(|p| p[3] != 255).count()).sum()
 }
 
 /// The white-balanced, retouched, denoised image.
@@ -601,7 +769,7 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
 fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
     let (w, h) = (plan.w, plan.h);
     let n = w * h;
-    let (lum, col) = local::nr_params(&plan.settings, plan.src_long, w.max(h));
+    let (lum, col) = local::nr_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h));
     let mut img = img;
     if let Some(nr) = lum {
         let l = cx.gpu.buffer(n);
@@ -679,6 +847,7 @@ fn prepare(cx: &mut Cx<'_>, lin: &Buf, plan: &Plan<'_>, req: &RenderRequest, pla
                 let sub = cx.gpu.buffer(m);
                 map(cx, "subsample", m, &[local::AIRLIGHT_STEP as u32], [Some(&d), None, None], &sub);
                 let air = local::airlight_of(cx.read(&sub, m));
+                cx.flush();
                 let b = Arc::new(d);
                 planes.dark = Some((sg.to_bits(), b.clone(), air));
                 (Some(b), air)
@@ -792,7 +961,7 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
                     Some(2)
                 }
                 MaskShape::ColorRange { samples, refine } => {
-                    let tol = 0.04 + 0.16 * (*refine as f32 / 100.0);
+                    let tol = lightcraft_pipeline::masks::color_range_tolerance(*refine);
                     p.extend([tol.to_bits(), ev.exp2().to_bits(), samples.len() as u32]);
                     aux.extend(samples.iter().flat_map(|s| s.map(|v| v as f32)));
                     Some(3)
@@ -849,7 +1018,7 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
                     // no kernel: evaluate on the CPU
                     let img = host.lin.get_or_insert_with(|| Arc::new(cx.read_rgb(lin, w, h))).clone();
                     let l = host.log_l.get_or_insert_with(|| Arc::new(cx.read_plane(&prep.log_l, w, h))).clone();
-                    let mut v = lightcraft_pipeline::masks::shape_alpha(&comp.shape, frame, w, h, &img, &l, ev);
+                    let mut v = lightcraft_pipeline::masks::shape_alpha(&comp.shape, frame, w, h, &img, &l, ev, plan.mattes.as_deref());
                     if comp.invert {
                         v.data.iter_mut().for_each(|x| *x = 1.0 - *x);
                     }
@@ -875,6 +1044,73 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_mask_matches_per_pixel_decision() {
+        use lightcraft_develop::{EmbeddedLens, EmbeddedWarp};
+        let lens = EmbeddedLens {
+            warp: Some(EmbeddedWarp {
+                planes: [[1.0, -0.03, 0.01, 0.0, 0.001, -0.002]; 3],
+                center: lightcraft_geom::Point::new(0.52, 0.48),
+                radius: 0.6,
+            }),
+            vignette: None,
+        };
+        let mut s = DevelopSettings::default();
+        s.optics.lens_profile = true;
+        s.optics.distortion = -40.0;
+        s.geometry.horizontal = -15.0;
+        s.geometry.rotate = 3.0;
+        for orientation in [Orientation::Normal, Orientation::Rotate270] {
+            s.orientation = orientation;
+            let f = lightcraft_pipeline::geometry::Frame::with_lens(900, 600, &s, true, Some(&lens));
+            let wp = f.warp.as_ref().expect("warp");
+            // widths that do and don't fill the last word; heights that do and don't fill the last band
+            for (w, h) in [f.fit(700, 700), (333, 221), (64, 16), (1, 1)] {
+                let o2t = f.out_to_oriented(w, h);
+                let mask = coverage_mask(wp, &o2t, w, h);
+                let words = w.div_ceil(32);
+                assert_eq!(mask.len(), words * h);
+                for y in 0..h {
+                    for x in 0..w {
+                        let bit = mask[y * words + x / 32] >> (x % 32) & 1 == 1;
+                        assert_eq!(bit, wp.covers(&o2t, x, y), "{orientation:?} {w}x{h}: pixel {x},{y}");
+                    }
+                    let pad = mask[y * words + words - 1] >> (w % 32);
+                    assert!(w.is_multiple_of(32) || pad == 0, "padding bits set");
+                }
+            }
+        }
+    }
+
+    /// The perspective horizon in view: its denominator is exactly 0 on output row 75 (clamped to 1e-300) and
+    /// changes sign there, so the blocks around it are undecided (clamp, and division by a range that may hold
+    /// zero) and are decided per pixel, while blocks clear of it are filled at once.
+    #[test]
+    fn coverage_mask_with_the_horizon_in_view() {
+        use lightcraft_geom::{Affine, Homography};
+        let (w, h) = (900, 600);
+        let mut wp = lightcraft_pipeline::optics::Warp::identity(w as f64, h as f64);
+        // centred coordinates: v = (y − 300) / 450, denominator 2·v + m8, exactly 0 at y = 75.5
+        let m8 = -((75.5 - 300.0) / 450.0 * 2.0);
+        wp.persp_inv = Homography([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, m8]);
+        wp.persp = wp.persp_inv.inverse().expect("invertible");
+        let o2t = Affine::IDENTITY;
+        assert_eq!(wp.block_coverage(&o2t, 0, 32, 64, 80), None, "the block holding the horizon");
+        assert_eq!(wp.block_coverage(&o2t, 0, 32, 0, 16), Some(false), "beyond the horizon");
+        assert_eq!(wp.block_coverage(&o2t, 448, 480, 288, 304), Some(true), "the centre");
+        let mask = coverage_mask(&wp, &o2t, w, h);
+        let words = w.div_ceil(32);
+        let mut covered = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let bit = mask[y * words + x / 32] >> (x % 32) & 1 == 1;
+                assert_eq!(bit, wp.covers(&o2t, x, y), "pixel {x},{y}");
+                covered += bit as usize;
+            }
+        }
+        assert!(covered > 0 && covered < w * h, "{covered} px covered");
+    }
 
     /// Kernel timings on a 24 MP plane: `cargo test --release -p lightcraft-gpu -- --ignored --nocapture`.
     #[test]

@@ -5,7 +5,7 @@ use lightcraft_develop::{CONTROLS, controls};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, cmd, has_active};
-use crate::Session;
+use crate::{LibrarySource, Session};
 
 pub fn photo_summary(p: &Photo) -> Value {
     json!({
@@ -48,8 +48,13 @@ fn album_json(a: &Album, all: &[Album], cat: &lightcraft_catalog::Catalog) -> Va
     v
 }
 
+/// The photo a query is about: `id` when given (which must be in the library), else the active one.
 fn photo_arg(s: &Session, p: &Value, c: &str) -> crate::Result<PhotoId> {
-    p.get("id").and_then(Value::as_u64).map(PhotoId).or(s.active()).ok_or_else(|| bad(c, "no photo"))
+    match p.get("id").and_then(Value::as_u64).map(PhotoId) {
+        Some(id) if s.catalog.photo(id).is_some() => Ok(id),
+        Some(id) => Err(bad(c, format!("no such photo {}", id.0))),
+        None => s.active().ok_or_else(|| bad(c, "no photo")),
+    }
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -81,10 +86,14 @@ pub fn specs() -> Vec<CommandSpec> {
             }))
         }),
         cmd!(query "library.state", "Library State", [], None, "{}", always, |s, _| {
-            let label = s.source.label(&s.catalog);
+            let label = match (s.source, s.library_folder.as_deref()) {
+                (LibrarySource::LibraryFolder, Some(path)) => lightcraft_catalog::folders::folder_label(path),
+                _ => s.source.label(&s.catalog),
+            };
             let n = s.visible().len();
             Ok(json!({
                 "source": s.source,
+                "libraryFolder": s.library_folder.as_ref().filter(|_| s.source == LibrarySource::LibraryFolder),
                 "sourceLabel": label,
                 "filter": s.filter,
                 "sort": s.sort,
@@ -113,7 +122,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 .map(|r| json!({"group": r.group, "tag": r.tag, "name": r.name, "value": r.value}))
                 .collect();
             // XMP: the sidecar if there is one, else the file's own packet
-            let packet = crate::sidecar::read_packet(path, ph.kind, s.xmp.naming).map(|(x, _)| x).or_else(|| lightcraft_meta::embedded(&bytes).xmp);
+            let packet = crate::sidecar::read_packet(path, ph.kind, s.sidecar_naming(ph.id)).map(|(x, _)| x).or_else(|| lightcraft_meta::embedded(&bytes).xmp);
             let xmp: Vec<Value> = packet
                 .and_then(|x| lightcraft_meta::parse_xmp(&x).ok())
                 .map(|d| d.properties.into_iter().filter(|(k, _)| !k.starts_with("lc:")).map(|(k, v)| json!({"name": k, "value": v.join("; ")})).collect())
@@ -186,11 +195,17 @@ pub fn specs() -> Vec<CommandSpec> {
                 "versions": ph.versions.iter().map(|v| json!({"name": v.name, "created": v.created})).collect::<Vec<_>>(),
             }))
         }),
-        cmd!(query "app.gpu", "GPU Rendering", [], None, "{enabled?: bool} — allow/forbid GPU rendering (CPU fallback; LIGHTCRAFT_GPU=0 forbids it for the process)", always, |_, p| {
+        cmd!(query "app.gpu", "GPU Rendering", [], None, "{enabled?: bool} — allow/forbid GPU rendering (CPU fallback; LIGHTCRAFT_GPU=0 forbids it for the process); returns {enabled, available, adapter, reason (why the GPU is off), lastFallback (latest render redone on the CPU, and why)}", always, |_, p| {
             if let Some(on) = p.get("enabled").and_then(Value::as_bool) {
                 lightcraft_gpu::set_enabled(on);
             }
-            Ok(json!({"enabled": lightcraft_gpu::enabled(), "available": lightcraft_gpu::available(), "adapter": lightcraft_gpu::adapter_name()}))
+            Ok(json!({
+                "enabled": lightcraft_gpu::enabled(),
+                "available": lightcraft_gpu::available(),
+                "adapter": lightcraft_gpu::adapter_name(),
+                "reason": lightcraft_gpu::unavailable_reason(),
+                "lastFallback": lightcraft_gpu::last_fallback(),
+            }))
         }),
         cmd!(query "library.memory", "Memory Usage", [], None, "{} — bytes held by each cache (decoded sources, rendered previews, GPU buffers; heap when instrumented)", always, |s, _| {
             Ok(serde_json::to_value(s.memory_report()).unwrap_or_default())

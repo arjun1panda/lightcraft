@@ -4,6 +4,11 @@
 //! files) but not fsynced; unreadable files are deleted and re-rendered. When the total size
 //! exceeds the budget, the least recently used files (by modification time, refreshed on read)
 //! are removed down to 80 % of the budget.
+//!
+//! The cache only ever lists, counts or deletes files of its own name shape
+//! (`<2 hex>/<32 hex>.jpg` and the `<32 hex>.tmp…` temp files of [`DiskCache::put`], see
+//! [`is_cache_file`]): the directory may be shared with other files (e.g. a library opened on a
+//! photo folder that already has a `thumbs/` folder), and those are never touched (issue #98).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -17,7 +22,8 @@ const QUALITY: u8 = 90;
 
 pub struct DiskCache {
     dir: PathBuf,
-    budget: u64,
+    /// Bytes the cache may hold (changed in place by [`DiskCache::set_budget`]).
+    budget: AtomicU64,
     /// Bytes on disk (`None` until first scanned).
     total: Mutex<Option<u64>>,
     pub hits: AtomicU64,
@@ -29,7 +35,7 @@ impl DiskCache {
     pub fn new(dir: &Path, budget: u64) -> DiskCache {
         DiskCache {
             dir: dir.to_path_buf(),
-            budget,
+            budget: AtomicU64::new(budget),
             total: Mutex::new(None),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -39,6 +45,17 @@ impl DiskCache {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Bytes the cache may hold.
+    pub fn budget(&self) -> u64 {
+        self.budget.load(Ordering::Relaxed)
+    }
+
+    /// Change the budget in place: the files stay valid (they are keyed by content), so a resize
+    /// keeps them; a smaller budget is enforced by the next write, like any other overflow.
+    pub fn set_budget(&self, bytes: u64) {
+        self.budget.store(bytes, Ordering::Relaxed);
     }
 
     fn path(&self, key: Hash128) -> PathBuf {
@@ -89,20 +106,32 @@ impl DiskCache {
             let mut t = self.total.lock().unwrap_or_else(|e| e.into_inner());
             let total = t.get_or_insert(0);
             *total += bytes.len() as u64;
-            *total > self.budget
+            *total > self.budget()
         };
         if over {
             self.prune();
         }
     }
 
-    /// All cache files: (path, size, modified).
+    /// All cache files (only names of the cache's own shape, see [`is_cache_file`]):
+    /// (path, size, modified).
     fn scan(&self) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
         let mut out = Vec::new();
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return out };
         for sub in rd.flatten() {
+            let sub_name = sub.file_name();
+            let Some(sub_name) = sub_name.to_str() else { continue };
+            if !is_shard_name(sub_name) {
+                continue;
+            }
             let Ok(files) = std::fs::read_dir(sub.path()) else { continue };
             for f in files.flatten() {
+                let name = f.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !is_cache_file(sub_name, name) {
+                    continue;
+                }
+                // `DirEntry::metadata` does not follow symlinks: a link is never a cache file
                 if let Ok(m) = f.metadata()
                     && m.is_file()
                 {
@@ -117,7 +146,7 @@ impl DiskCache {
     pub fn prune(&self) {
         let mut files = self.scan();
         let mut total: u64 = files.iter().map(|f| f.1).sum();
-        let target = self.budget / 5 * 4;
+        let target = self.budget() / 5 * 4;
         files.sort_by_key(|f| f.2);
         for (p, len, _) in files {
             if total <= target {
@@ -142,6 +171,29 @@ impl DiskCache {
         }
         *self.total.lock().unwrap_or_else(|e| e.into_inner()) = Some(0);
     }
+}
+
+fn is_lower_hex(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A shard directory name: two lowercase hex digits.
+fn is_shard_name(s: &str) -> bool {
+    s.len() == 2 && is_lower_hex(s)
+}
+
+/// Whether `name` inside shard directory `shard` is a file this cache wrote: `<32 hex>.jpg`
+/// (whose first two digits are the shard) or a `<32 hex>.tmp<alphanumeric>` temp file of
+/// [`DiskCache::put`]. Anything else in the cache directory belongs to someone else.
+pub fn is_cache_file(shard: &str, name: &str) -> bool {
+    if !is_shard_name(shard) {
+        return false;
+    }
+    let Some((stem, ext)) = name.split_once('.') else { return false };
+    if stem.len() != 32 || !is_lower_hex(stem) || !stem.starts_with(shard) {
+        return false;
+    }
+    ext == "jpg" || ext.strip_prefix("tmp").is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// Encode a thumbnail as the cache stores it (JPEG, RGB, 4:2:0).

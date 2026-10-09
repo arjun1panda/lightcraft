@@ -76,7 +76,13 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     let t = Tokens::get(ui.ctx());
     let d = app.session.develop_of(id).unwrap_or_default();
     // a raw shown from its embedded JPEG (preview only) gets the rendered-file white balance scale
-    let raw = app.session.catalog.photo(id).is_some_and(|p| p.develops_raw());
+    let raw = app.session.catalog.photo(id).is_some_and(|p| p.develops_raw() && !p.relative_wb());
+    let mut d = d;
+    if d.wb.mode == WbMode::AsShot && app.session.catalog.photo(id).is_some_and(|p| p.relative_wb()) {
+        let wb = &mut std::sync::Arc::make_mut(&mut d).wb;
+        wb.temp = 6500.0;
+        wb.tint = 0.0;
+    }
     let preview_only = app.session.catalog.photo(id).and_then(|p| p.preview_only.clone());
 
     if app.ui.histogram {
@@ -87,20 +93,21 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     }
     // header: Edit + Auto / B&W / HDR
     let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
-    ui.painter().text(pos2(hr.left() + 24.0, hr.bottom() - 10.0), Align2::LEFT_CENTER, "Edit", t.semibold(15.0), t.text);
+    ui.painter().text(pos2(hr.left() + 24.0, hr.bottom() - 10.0), Align2::LEFT_CENTER, crate::i18n::tr("Edit"), t.semibold(15.0), t.text);
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 8, bottom: 14 }).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            if text_button(ui, "auto", "Auto", false).clicked() {
+            if text_button(ui, "auto", crate::i18n::tr("Auto"), false).clicked() {
                 let _ = app.run("develop.auto", json!({}));
-                app.toast(ui.ctx(), "Auto settings applied");
+                app.toast(ui.ctx(), crate::i18n::tr("Auto settings applied"));
             }
             let bw = crate::is_bw(&d);
-            if text_button(ui, "bw", "B&W", bw).clicked() {
+            if text_button(ui, "bw", crate::i18n::tr("B&W"), bw).clicked() {
                 let _ = app.run("develop.treatment", json!({}));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if text_button(ui, "reset", "Reset", false).on_hover_text("Reset all edits (Cmd+Shift+R)").clicked() {
+                if text_button(ui, "reset", crate::i18n::tr("Reset"), false).on_hover_text(crate::i18n::tr("Reset all edits (Cmd+Shift+R)")).clicked()
+                {
                     let _ = app.run("develop.reset", json!({}));
                 }
             });
@@ -118,9 +125,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     if app.session.auto_sync && n > 1 {
         egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 0, bottom: 10 }).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("Auto Sync: edits apply to {n} photos")).color(t.accent).size(12.0));
+                ui.label(egui::RichText::new(crate::i18n::tr_format!("Auto Sync: edits apply to {n} photos", n = n)).color(t.accent).size(12.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if text_button(ui, "autoSyncOff", "Turn Off", false).clicked() {
+                    if text_button(ui, "autoSyncOff", crate::i18n::tr("Turn Off"), false).clicked() {
                         let _ = app.run("develop.autoSync", json!({"on": false}));
                     }
                 });
@@ -131,9 +138,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     // profile row
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 14, bottom: 14 }).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Profile").font(t.font(13.0)).color(t.text_dim));
-            let name = lightcraft_engine::presets::profile(&d.profile.id).map(|p| p.name).unwrap_or("Color");
-            let r = crate::widgets::dropdown(ui, "profile", name, t.font(15.0), t.text_label);
+            ui.label(egui::RichText::new(crate::i18n::tr("Profile")).font(t.font(13.0)).color(t.text_dim));
+            let name = app.session.profile_info(&d.profile.id).map(|(name, _)| name).unwrap_or("Color");
+            let r = crate::widgets::dropdown(ui, "profile", crate::i18n::profile_label(&d.profile.id, name), t.font(15.0), t.text_label);
             egui::Popup::menu(&r).show(|ui| profile_menu(app, ui, &d));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if crate::widgets::icon_button(ui, "profileBrowser", Icon::ProfileGrid, vec2(28.0, 28.0), false, true, "Browse Profiles").clicked() {
@@ -154,7 +161,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         }
         ui.add_space(6.0);
         let open = app.ui.flyout_open("curve");
-        if flyout_row(ui, "curve", "Curve", Icon::Curve, open).clicked() {
+        if flyout_row(ui, "curve", crate::i18n::tr("Curve"), Icon::Curve, open).clicked() {
             app.ui.toggle_flyout("curve");
         }
         if open {
@@ -166,8 +173,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         // White balance row
         egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 2, bottom: 2 }).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("White Balance").font(t.font(13.0)).color(t.text_dim));
-                let r = crate::widgets::dropdown(ui, "wbMode", d.wb.mode.label(), t.font(14.0), t.text_label);
+                ui.label(egui::RichText::new(crate::i18n::tr("White Balance")).font(t.font(13.0)).color(t.text_dim));
+                let r = crate::widgets::dropdown(ui, "wbMode", crate::i18n::tr(d.wb.mode.label()), t.font(14.0), t.text_label);
                 egui::Popup::menu(&r).show(|ui| {
                     for m in WbMode::ALL {
                         if m == WbMode::Custom {
@@ -210,7 +217,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         }
         if !crate::is_bw(d) {
             let open = app.ui.flyout_open("pointColor");
-            if flyout_row(ui, "pointColor", "Point Color", Icon::Picker, open).clicked() {
+            if flyout_row(ui, "pointColor", crate::i18n::tr("Point Color"), Icon::Picker, open).clicked() {
                 app.ui.toggle_flyout("pointColor");
             }
             if open {
@@ -218,7 +225,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             }
         }
         let open = app.ui.flyout_open("grading");
-        if flyout_row(ui, "grading", "Color Grading", Icon::Presets, open).clicked() {
+        if flyout_row(ui, "grading", crate::i18n::tr("Color Grading"), Icon::Presets, open).clicked() {
             app.ui.toggle_flyout("grading");
         }
         if open {
@@ -230,7 +237,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         for c in ["effects.texture", "effects.clarity", "effects.dehaze"] {
             control(app, ui, d, c, true);
         }
-        sub_title(ui, "Vignette");
+        sub_title(ui, crate::i18n::tr("Vignette"));
         {
             use lightcraft_develop::VignetteStyle as V;
             let styles = [
@@ -255,7 +262,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             let enabled = c == "vignette.amount" || d.vignette.amount != 0.0;
             control(app, ui, d, c, enabled);
         }
-        sub_title(ui, "Grain");
+        sub_title(ui, crate::i18n::tr("Grain"));
         for c in ["grain.amount", "grain.size", "grain.roughness"] {
             control(app, ui, d, c, c == "grain.amount" || d.grain.amount != 0.0);
         }
@@ -265,7 +272,15 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         for c in ["detail.sharpenAmount", "detail.sharpenRadius", "detail.sharpenDetail", "detail.sharpenMasking"] {
             control(app, ui, d, c, c == "detail.sharpenAmount" || d.detail.sharpen_amount > 0.0);
         }
-        sub_title(ui, "Noise Reduction");
+        // AI Denoise is its own tool, apart from the manual noise reduction sliders below it
+        sub_title(ui, crate::i18n::tr("AI Denoise"));
+        // AI Denoise: how much of the photo's cleaned picture to mix in (raw files only), and what that picture is doing
+        let applicable = !matches!(app.session.denoise_photo_state(id), lightcraft_engine::denoise::PhotoState::NotApplicable);
+        let on = d.enhance.denoise_enabled();
+        super::denoise::detail_toggle(app, ui, id, on, applicable);
+        control(app, ui, d, "enhance.denoise", applicable && on);
+        super::denoise::detail_status(app, ui, id, if on { d.enhance.denoise } else { 0.0 });
+        sub_title(ui, crate::i18n::tr("Noise Reduction"));
         for c in ["detail.nrLuminance", "detail.nrDetail", "detail.nrContrast", "detail.nrColor", "detail.nrColorDetail", "detail.nrColorSmoothness"]
         {
             control(app, ui, d, c, true);
@@ -276,16 +291,16 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         let has_lens = app.session.catalog.photo(id).is_some_and(|p| p.embedded_lens.is_some());
         egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 4, bottom: 4 }).show(ui, |ui| {
             let mut ca = d.optics.remove_ca;
-            if ui.checkbox(&mut ca, "Remove Chromatic Aberration").changed() {
+            if ui.checkbox(&mut ca, crate::i18n::tr("Remove Chromatic Aberration")).changed() {
                 let _ = app.run("develop.merge", json!({"settings": {"optics": {"remove_ca": ca}}, "label": "Remove CA"}));
             }
             let mut lp = d.optics.lens_profile;
-            if ui.checkbox(&mut lp, "Enable Lens Corrections").changed() {
+            if ui.checkbox(&mut lp, crate::i18n::tr("Enable Lens Corrections")).changed() {
                 let _ = app.run("develop.merge", json!({"settings": {"optics": {"lens_profile": lp}}, "label": "Lens Corrections"}));
             }
             if lp && !has_lens {
                 ui.label(
-                    egui::RichText::new("No lens data embedded in this file (DNG lens opcodes only).")
+                    egui::RichText::new(crate::i18n::tr("No lens data embedded in this file (DNG lens opcodes only)."))
                         .size(11.0)
                         .color(Tokens::get(ui.ctx()).text_dim),
                 );
@@ -296,14 +311,14 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 control(app, ui, d, c, has_lens);
             }
         }
-        sub_title(ui, "Manual");
+        sub_title(ui, crate::i18n::tr("Manual"));
         for c in ["optics.distortion", "optics.vignetting"] {
             control(app, ui, d, c, true);
         }
         control(app, ui, d, "optics.vignettingMidpoint", d.optics.vignetting != 0.0);
         ui.add_space(6.0);
         let open = app.ui.flyout_open("defringe");
-        if flyout_row(ui, "defringe", "Defringe", Icon::Picker, open).clicked() {
+        if flyout_row(ui, "defringe", crate::i18n::tr("Defringe"), Icon::Picker, open).clicked() {
             app.ui.toggle_flyout("defringe");
         }
         if open {
@@ -315,7 +330,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             let on = d.optics.defringe_green_amount > 0.0;
             control(app, ui, d, "optics.defringeGreenHueLo", on);
             control(app, ui, d, "optics.defringeGreenHueHi", on);
-            sub_title(ui, "Lateral Chromatic Aberration");
+            sub_title(ui, crate::i18n::tr("Lateral Chromatic Aberration"));
             control(app, ui, d, "optics.caRed", true);
             control(app, ui, d, "optics.caBlue", true);
         }
@@ -323,7 +338,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     });
     // Lightroom Classic's Calibration panel (the cloud app hides it): last, like there.
     section(app, ui, &d, "calibration", "Calibration", |app, ui, d| {
-        sub_title(ui, "Shadows");
+        sub_title(ui, crate::i18n::tr("Shadows"));
         control(app, ui, d, "calibration.shadowsTint", true);
         for (title, k) in [("Red Primary", "red"), ("Green Primary", "green"), ("Blue Primary", "blue")] {
             sub_title(ui, title);
@@ -338,71 +353,88 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
 /// The profile dropdown: Favorites, Recent, one submenu per group, then favourite toggle and
 /// Browse….
 fn profile_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings) {
-    use lightcraft_engine::presets::{PROFILES, profile, profile_groups};
+    use lightcraft_engine::presets::{PROFILES, profile_groups};
     let t = Tokens::get(ui.ctx());
     ui.set_min_width(200.0);
     let cur = d.profile.id.as_str();
     // (clicked, hovered)
-    let mut pick: (Option<&'static str>, Option<&'static str>) = (None, None);
-    let item = |ui: &mut egui::Ui,
-                key: &str,
-                p: &'static lightcraft_engine::presets::ProfileInfo,
-                pick: &mut (Option<&'static str>, Option<&'static str>)| {
-        let r = ui.selectable_label(p.id == cur, p.name);
-        register(ui.ctx(), format!("profileMenu:{key}:{}", p.id), r.rect);
+    let mut pick: (Option<String>, Option<String>) = (None, None);
+    let item = |ui: &mut egui::Ui, key: &str, id: &str, name: &str, pick: &mut (Option<String>, Option<String>)| {
+        let r = ui.selectable_label(id == cur, crate::i18n::profile_label(id, name));
+        register(ui.ctx(), format!("profileMenu:{key}:{id}"), r.rect);
         if r.clicked() {
-            pick.0 = Some(p.id);
+            pick.0 = Some(id.to_string());
         }
         if r.hovered() {
-            pick.1 = Some(p.id);
+            pick.1 = Some(id.to_string());
         }
     };
     let heading = |ui: &mut egui::Ui, s: &str| {
-        ui.label(egui::RichText::new(s).font(t.semibold(11.5)).color(t.text_dim));
+        ui.label(egui::RichText::new(crate::i18n::tr(s)).font(t.semibold(11.5)).color(t.text_dim));
     };
     for (title, key, ids) in [("Favorites", "fav", app.session.profile_favorites.clone()), ("Recent", "recent", app.session.profile_recent.clone())] {
-        let list: Vec<_> = ids.iter().filter_map(|id| profile(id)).collect();
+        let list: Vec<_> = ids.iter().filter_map(|id| app.session.profile_info(id).map(|(name, _)| (id.as_str(), name))).collect();
         if list.is_empty() {
             continue;
         }
         heading(ui, title);
-        for p in list {
-            item(ui, key, p, &mut pick);
+        for (id, name) in list {
+            item(ui, key, id, name, &mut pick);
         }
         ui.separator();
     }
     for g in profile_groups() {
-        let r = ui.menu_button(g, |ui| {
+        let r = ui.menu_button(crate::i18n::tr(g), |ui| {
             ui.set_min_width(170.0);
             for p in PROFILES.iter().filter(|p| p.group == g) {
-                item(ui, "group", p, &mut pick);
+                item(ui, "group", p.id, p.name, &mut pick);
             }
         });
         register(ui.ctx(), format!("profileMenu:groupMenu:{g}"), r.response.rect);
     }
+    // imported LUT profile groups
+    let mut lut_groups: Vec<String> = app.session.lut_profiles.iter().map(|p| p.group.clone()).collect();
+    lut_groups.sort_unstable();
+    lut_groups.dedup();
+    for g in &lut_groups {
+        // a folder's name as it is, and its own widget id even when it matches a built-in group
+        let r = ui.menu_button(g.as_str(), |ui| {
+            ui.set_min_width(170.0);
+            for p in app.session.lut_profiles.iter().filter(|p| &p.group == g) {
+                item(ui, "group", &p.id, &p.name, &mut pick);
+            }
+        });
+        register(ui.ctx(), format!("profileMenu:lutGroupMenu:{g}"), r.response.rect);
+    }
     ui.separator();
-    if let Some(p) = profile(cur) {
-        let fav = app.session.profile_favorites.iter().any(|f| f == p.id);
-        let label = if fav { format!("Remove “{}” from Favorites", p.name) } else { format!("Add “{}” to Favorites", p.name) };
+    if let Some((name, _)) = app.session.profile_info(cur) {
+        let fav = app.session.profile_favorites.iter().any(|f| f == cur);
+        let label = if fav {
+            crate::i18n::tr_format!("Remove “{}” from Favorites", crate::i18n::profile_label(cur, name))
+        } else {
+            crate::i18n::tr_format!("Add “{}” to Favorites", crate::i18n::profile_label(cur, name))
+        };
         let r = ui.button(label);
         register(ui.ctx(), "profileMenu:toggleFavorite", r.rect);
         if r.clicked() {
-            let _ = app.run("profile.favorite", json!({"id": p.id}));
+            let _ = app.run("profile.favorite", json!({"id": cur}));
         }
     }
-    let r = ui.button("Browse…");
+    let r = ui.button(crate::i18n::tr("Browse…"));
     register(ui.ctx(), "profileMenu:browse", r.rect);
     if r.clicked() {
         let _ = app.run("panel.profiles", json!({}));
     }
     // resting on a profile previews it in the loupe
-    if let Some(p) = pick.1.and_then(profile)
-        && p.id != cur
+    if let Some(hovered_id) = &pick.1
+        && hovered_id != cur
+        && let Some((name, _)) = app.session.profile_info(hovered_id)
     {
         let mut s = d.clone();
-        s.profile.id = p.id.to_string();
+        s.profile.id = hovered_id.clone();
         s.profile.amount = 100.0;
-        app.hover_preview = Some(crate::HoverPreview { label: format!("Profile: {}", p.name), settings: s });
+        app.hover_preview =
+            Some(crate::HoverPreview { label: crate::i18n::tr_format!("Profile: {}", crate::i18n::profile_label(hovered_id, name)), settings: s });
     }
     if let Some(id) = pick.0 {
         let _ = app.run("develop.profile", json!({"id": id}));
@@ -412,7 +444,7 @@ fn profile_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings)
 pub fn sub_title(ui: &mut egui::Ui, title: &str) {
     let t = Tokens::get(ui.ctx());
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-    ui.painter().text(pos2(r.left() + 24.0, r.center().y + 4.0), Align2::LEFT_CENTER, title, t.semibold(13.0), t.text_label);
+    ui.painter().text(pos2(r.left() + 24.0, r.center().y + 4.0), Align2::LEFT_CENTER, crate::i18n::tr(title), t.semibold(13.0), t.text_label);
 }
 
 fn section(
@@ -531,16 +563,17 @@ fn soft_proofing(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     let t = Tokens::get(ui.ctx());
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 8, bottom: 6 }).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Soft Proofing").color(t.text).strong());
+            ui.label(RichText::new(crate::i18n::tr("Soft Proofing")).color(t.text).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut dest = app.ui.proof.dest_warning;
                 let r = ui
                     .toggle_value(&mut dest, RichText::new("■").color(Color32::from_rgb(255, 40, 40)))
-                    .on_hover_text("Show destination gamut warning");
+                    .on_hover_text(crate::i18n::tr("Show destination gamut warning"));
                 register(ui.ctx(), "button:proofDestWarning", r.rect);
                 let mut disp = app.ui.proof.display_warning;
-                let r2 =
-                    ui.toggle_value(&mut disp, RichText::new("■").color(Color32::from_rgb(40, 90, 255))).on_hover_text("Show display gamut warning");
+                let r2 = ui
+                    .toggle_value(&mut disp, RichText::new("■").color(Color32::from_rgb(40, 90, 255)))
+                    .on_hover_text(crate::i18n::tr("Show display gamut warning"));
                 register(ui.ctx(), "button:proofDisplayWarning", r2.rect);
                 if dest != app.ui.proof.dest_warning || disp != app.ui.proof.display_warning {
                     let _ = app.run("view.softProof", json!({"destWarning": dest, "displayWarning": disp}));
@@ -548,7 +581,7 @@ fn soft_proofing(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             });
         });
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Profile:").color(t.text_label));
+            ui.label(RichText::new(crate::i18n::tr("Profile:")).color(t.text_label));
             let cur = app.ui.proof.space;
             egui::ComboBox::from_id_salt("proof-space").width(170.0).selected_text(cur.label()).show_ui(ui, |ui| {
                 for s in OutputSpace::ALL {
@@ -558,12 +591,12 @@ fn soft_proofing(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 }
             });
         });
-        let r = ui.button("Create Proof Copy");
+        let r = ui.button(crate::i18n::tr("Create Proof Copy"));
         register(ui.ctx(), "button:createProofCopy", r.rect);
         if r.clicked() {
-            let name = format!("Proof Copy ({})", app.ui.proof.space.label());
+            let name = crate::i18n::tr_format!("Proof Copy ({})", app.ui.proof.space.label());
             if app.run("photo.virtualCopy", json!({"ids": [id.0], "name": name})).is_ok() {
-                app.toast(ui.ctx(), "Proof copy created");
+                app.toast(ui.ctx(), crate::i18n::tr("Proof copy created"));
             }
         }
     });
@@ -605,7 +638,7 @@ fn curve_editor(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, d: &Dev
                     "green" => "Green channel",
                     _ => "Blue channel",
                 };
-                let resp = resp.on_hover_text(format!("{name} — double-click to reset it"));
+                let resp = resp.on_hover_text(crate::i18n::tr_format!("{name} — double-click to reset it", name = name));
                 if resp.double_clicked() {
                     app.ui.curve_channel = ch.into();
                     let _ = app.run("curve.reset", json!({"channel": ch}));
@@ -796,9 +829,11 @@ fn curve_footer(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings)
     let t = Tokens::get(ui.ctx());
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 2, bottom: 4 }).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Point Curve").font(t.font(12.0)).color(t.text_label));
+            ui.label(RichText::new(crate::i18n::tr("Point Curve")).font(t.font(12.0)).color(t.text_label));
             let current = matching_preset(&app.session, &d.curve);
-            let r = crate::widgets::dropdown(ui, "curvePreset", current.as_deref().unwrap_or("Custom"), t.font(12.0), t.text);
+            let builtin = current.as_ref().is_none_or(|name| all_presets(&app.session).iter().any(|p| p.builtin && &p.name == name));
+            let label = crate::i18n::builtin_label(current.as_deref().unwrap_or("Custom"), builtin);
+            let r = crate::widgets::dropdown(ui, "curvePreset", label, t.font(12.0), t.text);
             egui::Popup::menu(&r).show(|ui| {
                 ui.set_min_width(180.0);
                 let presets = all_presets(&app.session);
@@ -808,7 +843,7 @@ fn curve_footer(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings)
                         user_seen = true;
                         ui.separator();
                     }
-                    let r = ui.selectable_label(current.as_deref() == Some(p.name.as_str()), &p.name);
+                    let r = ui.selectable_label(current.as_deref() == Some(p.name.as_str()), crate::i18n::builtin_label(&p.name, p.builtin));
                     register(ui.ctx(), format!("curvePreset:{}", p.name), r.rect);
                     if r.clicked() {
                         let _ = app.run("curve.applyPreset", json!({"name": p.name}));
@@ -816,7 +851,7 @@ fn curve_footer(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings)
                     }
                     if !p.builtin {
                         r.context_menu(|ui| {
-                            if ui.button("Delete Preset").clicked() {
+                            if ui.button(crate::i18n::tr("Delete Preset")).clicked() {
                                 let _ = app.run("curve.deletePreset", json!({"name": p.name}));
                                 ui.close();
                             }
@@ -825,28 +860,29 @@ fn curve_footer(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings)
                 }
                 ui.separator();
                 let shaped = current.as_deref() != Some("Linear");
-                let r = ui.add_enabled(shaped, egui::Button::new("Save Point Curve…"));
+                let r = ui.add_enabled(shaped, egui::Button::new(crate::i18n::tr("Save Point Curve…")));
                 register(ui.ctx(), "curvePresetMenu:save", r.rect);
                 if r.clicked() {
                     crate::panels::dialogs::prompt(app, "Save Point Curve Preset", "Preset name", "", "curve.savePreset", json!({}), "name");
                     ui.close();
                 }
-                if ui.add_enabled(app.services.pick_curve_preset_files.is_some(), egui::Button::new("Import Presets…")).clicked() {
+                if ui.add_enabled(app.services.pick_curve_preset_files.is_some(), egui::Button::new(crate::i18n::tr("Import Presets…"))).clicked() {
                     let _ = app.run("file.importCurvePresets", json!({}));
                     ui.close();
                 }
                 let can_export = app.services.save_curve_preset_file.is_some() && !app.session.curve_presets.is_empty();
-                if ui.add_enabled(can_export, egui::Button::new("Export Presets…")).clicked() {
+                if ui.add_enabled(can_export, egui::Button::new(crate::i18n::tr("Export Presets…"))).clicked() {
                     let _ = app.run("file.exportCurvePresets", json!({}));
                     ui.close();
                 }
                 if presets.iter().any(|p| !p.builtin) {
-                    ui.label(RichText::new("Right-click a preset to delete it").font(t.font(11.0)).color(t.text_dim));
+                    ui.label(RichText::new(crate::i18n::tr("Right-click a preset to delete it")).font(t.font(11.0)).color(t.text_dim));
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let r = text_button(ui, "curveReset", "Reset", false)
-                    .on_hover_text("Reset all curves: point curves (all channels) and parametric (double-click a channel to reset only that one)");
+                let r = text_button(ui, "curveReset", crate::i18n::tr("Reset"), false).on_hover_text(crate::i18n::tr(
+                    "Reset all curves: point curves (all channels) and parametric (double-click a channel to reset only that one)",
+                ));
                 if r.clicked() {
                     let _ = app.run("curve.reset", json!({"channel": "all"}));
                 }
@@ -857,14 +893,15 @@ fn curve_footer(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings)
 
 /// Right-click menu of the curve graph.
 fn curve_reset_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, ch: &str) {
-    let label = if ch == "parametric" { "Reset Parametric Curve".to_string() } else { format!("Reset {} Channel", channel_label(ch)) };
+    let label =
+        if ch == "parametric" { "Reset Parametric Curve".to_string() } else { crate::i18n::tr_format!("Reset {} Channel", channel_label(ch)) };
     let r = ui.button(label);
     register(ui.ctx(), "curveMenu:resetChannel", r.rect);
     if r.clicked() {
         let _ = app.run("curve.reset", json!({"channel": ch}));
         ui.close();
     }
-    let r = ui.button("Reset All Curves");
+    let r = ui.button(crate::i18n::tr("Reset All Curves"));
     register(ui.ctx(), "curveMenu:resetAll", r.rect);
     if r.clicked() {
         let _ = app.run("curve.reset", json!({"channel": "all"}));
@@ -925,7 +962,7 @@ fn mixer(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings) {
                 let tool = format!("tat:{k}");
                 let active = app.ui.tool == tool;
                 if text_button(ui, &format!("tatMixer-{k}"), label, active)
-                    .on_hover_text("Targeted adjustment: drag up/down on the photo to adjust the colours there")
+                    .on_hover_text(crate::i18n::tr("Targeted adjustment: drag up/down on the photo to adjust the colours there"))
                     .clicked()
                 {
                     app.ui.tool = if active { String::new() } else { tool };
@@ -937,7 +974,10 @@ fn mixer(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings) {
     if crate::is_bw(d) {
         ui.horizontal(|ui| {
             ui.add_space(24.0);
-            if crate::widgets::text_button(ui, "bwAuto", "Auto", false).on_hover_text("Set the mix from the photo's colours").clicked() {
+            if crate::widgets::text_button(ui, "bwAuto", crate::i18n::tr("Auto"), false)
+                .on_hover_text(crate::i18n::tr("Set the mix from the photo's colours"))
+                .clicked()
+            {
                 let _ = app.run("develop.autoBwMix", json!({}));
             }
         });
@@ -994,25 +1034,25 @@ fn point_color(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings) 
     });
     if n == 0 {
         egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 2, bottom: 8 }).show(ui, |ui| {
-            ui.label(egui::RichText::new("Pick a colour on the photo with the eyedropper.").size(12.0).color(t.text_dim));
+            ui.label(egui::RichText::new(crate::i18n::tr("Pick a colour on the photo with the eyedropper.")).size(12.0).color(t.text_dim));
         });
         return;
     }
     for k in ["hueShift", "satShift", "lumShift", "variance"] {
         control(app, ui, d, &format!("pointColor.{sel}.{k}"), true);
     }
-    sub_title(ui, "Range");
+    sub_title(ui, crate::i18n::tr("Range"));
     for k in ["range", "hueRange", "satRange", "lumRange"] {
         control(app, ui, d, &format!("pointColor.{sel}.{k}"), true);
     }
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 4, bottom: 8 }).show(ui, |ui| {
         ui.horizontal(|ui| {
             let mut v = app.ui.point_color_visualize;
-            if ui.checkbox(&mut v, "Visualize range").changed() {
+            if ui.checkbox(&mut v, crate::i18n::tr("Visualize range")).changed() {
                 app.ui.point_color_visualize = v;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if text_button(ui, "pointColorDelete", "Delete", false).clicked() {
+                if text_button(ui, "pointColorDelete", crate::i18n::tr("Delete"), false).clicked() {
                     let _ = app.run("pointColor.delete", json!({"index": sel}));
                 }
             });
@@ -1047,9 +1087,9 @@ fn grading(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings) {
         let dot = c + vec2(a.cos(), -a.sin()) * rad * (wh.sat as f32 / 100.0);
         ui.painter().circle_filled(dot, 5.0, Color32::WHITE);
         ui.painter().circle_stroke(dot, 5.0, Stroke::new(1.0, Color32::BLACK));
-        ui.painter().text(pos2(c.x, c.y + rad + 12.0), Align2::CENTER_CENTER, label, t.font(12.0), t.text_label);
+        ui.painter().text(pos2(c.x, c.y + rad + 12.0), Align2::CENTER_CENTER, crate::i18n::tr(label), t.font(12.0), t.text_label);
         if resp.drag_started() {
-            let _ = app.run("develop.beginInteraction", json!({"label": format!("{label} Grading")}));
+            let _ = app.run("develop.beginInteraction", json!({"label": crate::i18n::tr_format!("{label} Grading", label = label)}));
         }
         if (resp.dragged() || resp.clicked())
             && let Some(q) = resp.interact_pointer_pos()
@@ -1093,7 +1133,7 @@ fn paint_wheel(p: &egui::Painter, c: Pos2, rad: f32) {
 fn quick_develop(app: &mut LightcraftApp, ui: &mut egui::Ui, n: usize) {
     let t = Tokens::get(ui.ctx());
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 0, bottom: 10 }).show(ui, |ui| {
-        ui.label(egui::RichText::new(format!("Quick Develop · {n} photos")).color(t.text_label).size(12.5));
+        ui.label(egui::RichText::new(crate::i18n::tr_format!("Quick Develop · {n} photos", n = n)).color(t.text_label).size(12.5));
         ui.add_space(4.0);
         let rows: [(&str, &str, f64, f64); 9] = [
             ("Exposure", "light.exposure", 1.0 / 3.0, 1.0),
@@ -1108,11 +1148,13 @@ fn quick_develop(app: &mut LightcraftApp, ui: &mut egui::Ui, n: usize) {
         ];
         egui::Grid::new("quick-develop").num_columns(5).spacing([4.0, 3.0]).show(ui, |ui| {
             for (label, ctl, small, big) in rows {
-                ui.label(egui::RichText::new(label).size(11.5).color(t.text_dim));
+                ui.label(egui::RichText::new(crate::i18n::tr(label)).size(11.5).color(t.text_dim));
                 for (txt, d) in [("◀◀", -big), ("◀", -small), ("▶", small), ("▶▶", big)] {
                     let r = ui.add(egui::Button::new(egui::RichText::new(txt).size(10.0)).min_size(egui::vec2(28.0, 18.0)));
                     crate::widgets::register(ui.ctx(), format!("button:quick-{ctl}-{txt}"), r.rect);
-                    if r.on_hover_text(format!("{label} {d:+} on every selected photo")).clicked() {
+                    if r.on_hover_text(crate::i18n::tr_format!("{label} {d:+} on every selected photo", d = d, label = crate::i18n::tr(label)))
+                        .clicked()
+                    {
                         let _ = app.run("develop.quickAdjust", json!({"control": ctl, "delta": d}));
                     }
                 }

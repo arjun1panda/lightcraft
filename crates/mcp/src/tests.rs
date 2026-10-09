@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::{Headless, PROTOCOL_VERSION, Server, call_tool, command_tool_name};
+use crate::{Backend, Headless, PROTOCOL_VERSION, Server, call_tool, command_tool_name};
 
 fn server() -> Server {
     Server::new(Box::new(Headless::demo()))
@@ -92,6 +92,53 @@ fn import_tool_copies_with_a_folder_template() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Issue #93: `render_photo`, `ui.render` and `app.export` with an exact `path` must not replace
+/// a photo's original.
+#[test]
+fn path_writes_never_replace_an_original() {
+    let base = std::env::temp_dir().join(format!("lc-mcp-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let img = lightcraft_raster::Rgba8 { width: 8, height: 8, data: vec![[90, 30, 9, 255]; 64] };
+    let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+    let orig = base.join("a.png");
+    std::fs::write(&orig, &png).unwrap();
+    let mut b = Headless::demo();
+    let r = call_tool(&mut b, "import", &json!({"paths": [orig.to_string_lossy()]}));
+    assert!(!r.is_error, "{r:?}");
+    let id = b.session.catalog.photos().find(|p| p.file_name == "a.png").unwrap().id.0;
+    let path = orig.to_string_lossy().to_string();
+    let r = call_tool(&mut b, "render_photo", &json!({"id": id, "path": path}));
+    assert!(r.is_error, "{r:?}");
+    assert!(b.call("ui.render", json!({"id": id, "path": path})).unwrap_err().contains("original"));
+    let e = b.call("app.export", json!({"ids": [id], "path": path})).unwrap_err();
+    assert!(e.contains("never writes over an original"), "{e}");
+    assert_eq!(std::fs::read(&orig).unwrap(), png, "the original is untouched");
+    // another path still works
+    let r = call_tool(&mut b, "render_photo", &json!({"id": id, "path": base.join("render.png").to_string_lossy()}));
+    assert!(!r.is_error, "{r:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Issue #181: a misspelled or unreadable `app.export` param is an error through the headless
+/// backend (what `lightcraft-cli run` and the MCP `export` tool use), not a silent default.
+#[test]
+fn export_refuses_unknown_params_and_bad_values() {
+    let mut b = Headless::demo();
+    let out = "/nonexistent-lc-test/x.jpg";
+    let e = b.call("app.export", json!({"path": out, "longEdgee": 400})).unwrap_err();
+    assert!(e.contains("unknown parameter `longEdgee` (did you mean `longEdge`?)"), "{e}");
+    let e = b.call("app.export", json!({"path": out, "longEdge": "banana"})).unwrap_err();
+    assert!(e.contains("`longEdge` must be a number"), "{e}");
+    let e = b.call("app.export", json!({"path": out, "watermark": {"text": "x", "size": 3}})).unwrap_err();
+    assert!(e.contains("`watermark.size` must be a number 0.005..0.5"), "{e}");
+    // `export` tool and preset expansion go through the same check
+    let r = call_tool(&mut b, "export", &json!({"path": out, "quality": 101}));
+    assert!(r.is_error, "{r:?}");
+    let e = b.session.execute("export.savePreset", &json!({"name": "Typo", "params": {"qualty": 5}})).unwrap_err().to_string();
+    assert!(e.contains("did you mean `quality`"), "{e}");
+}
+
 /// The `import` helper moves: renamed into the folder template, the source removed.
 #[test]
 fn import_tool_moves_with_a_folder_template() {
@@ -176,4 +223,25 @@ fn resources() {
         serde_json::from_str::<Value>(text).unwrap();
     }
     assert_eq!(rpc(&mut s, 99, "resources/read", json!({"uri": "lightcraft://nope"}))["error"]["code"], -32002);
+}
+
+/// `select_photos` with an id that is not in the library is a tool error, and the photo that was
+/// active stays active (#182).
+#[test]
+fn select_photos_rejects_unknown_ids_and_keeps_the_active_photo() {
+    let mut b = Headless::demo();
+    let first = b.session.visible_cloned()[0];
+    let r = call_tool(&mut b, "select_photos", &json!({"ids": [first.0]}));
+    assert!(!r.is_error, "{r:?}");
+    let r = call_tool(&mut b, "select_photos", &json!({"ids": [9999]}));
+    assert!(r.is_error, "{r:?}");
+    assert!(r.content[0]["text"].as_str().unwrap().contains("no such photo 9999"), "{r:?}");
+    assert_eq!(b.session.active(), Some(first));
+    let r = call_tool(&mut b, "get_develop", &json!({}));
+    assert!(!r.is_error, "{r:?}");
+    let r = call_tool(&mut b, "get_develop", &json!({"id": 9999}));
+    assert!(r.is_error, "{r:?}");
+    let r = call_tool(&mut b, "set_develop", &json!({"id": 9999, "values": {"light.exposure": 1.0}}));
+    assert!(r.is_error, "{r:?}");
+    assert_eq!(b.session.active(), Some(first));
 }

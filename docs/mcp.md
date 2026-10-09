@@ -15,7 +15,10 @@ It runs in one of two modes:
 
 Options: `--library DIR` opens (or creates) a persistent LightCraft library — the same crash-safe
 format the desktop app uses (`~/Pictures/LightCraft Library` by default there) — so ratings, edits and albums
-survive between sessions (with `--demo`, a new library is seeded with the demo photos);
+survive between sessions (with `--demo`, a new library is seeded with the demo photos). A library
+is open in one program at a time (`catalog.lock` in the library folder): while the desktop app has
+it open, `--library` on the same folder fails with "This library is already open in LightCraft
+(process N …)" — use connect mode to work with the running app instead;
 `--demo` starts the headless session with the procedurally generated demo library;
 `--compact` lists only the helper tools (see below). In connect mode the server starts even when
 the app is not running yet and connects on the first call (and reconnects if the app restarts).
@@ -78,7 +81,7 @@ During development you can also point the client at `cargo run --release -p ligh
 | `run_command {command, params?}` | Run any command by id |
 | `import {paths, album?, mode?, destination?, organize?, rename?}` | Import files/folders (folders are scanned recursively); the first new photo becomes active. `mode: "copy"` copies into `destination` (default: the library's Originals/), `mode: "move"` moves there (each original and its XMP sidecars are removed from the source only after the copy is verified and catalogued; duplicates and failures keep their sources; the result's `moved` / `kept` list what moved and what stayed, and why; undo leaves the moved files at the destination), filed by `organize`: `date` (YYYY/YYYY-MM-DD), `month`, `flat` or a folder template such as `{date:%Y}/{date:%Y%m%d}` (→ `2026/20260114`; capture date, else the import date; always inside the destination), and named by the `rename` template (`run_command photo.renameTokens` lists the tags) |
 | `query_photos {filter?, sort?, offset?, limit?}` | Photos in the current view (or matching a catalog `Filter`) |
-| `select_photos {ids, active?, mode?}` | Set the selection / active photo |
+| `select_photos {ids, active?, mode?}` | Set the selection / active photo. Every id (and `active`) must be in the library: an unknown id is a tool error (`no such photo 9999`) and the selection and active photo are left as they were |
 | `list_controls {section?}` | Every develop slider: id (`light.exposure`…), range, default, current value |
 | `get_develop {id?}` | Full develop-settings JSON |
 | `set_develop {id?, values?, settings?, label?}` | `values`: `{controlId: number}`; `settings`: partial develop JSON deep-merged. Undoable |
@@ -109,8 +112,8 @@ command registry (engine commands, plus the app's UI commands such as `view.deta
 connected): the id with `.` replaced by `_` and a `cmd_` prefix — `photo.rate` → `cmd_photo_rate`,
 `develop.set` → `cmd_develop_set`, `edit.undo` → `cmd_edit_undo`. Arguments are the command's
 JSON params (documented in each tool's description and by `list_commands`). Pass `--compact` to
-leave these out (about 90 headless / 140 connected) when a client struggles with many tools;
-`run_command` still reaches every command.
+leave these per-command tools out when a client struggles with a large tool list; `run_command`
+still reaches every command.
 
 ## Resources
 
@@ -141,6 +144,10 @@ results with `isError: true` so the model can read and correct them; malformed J
 standard error codes (-32700 parse, -32600 invalid request, -32601 method not found, -32602
 invalid params, -32002 resource not found).
 
+With `--library`, a command whose change can't be written to disk (disk full, …) is an error too:
+`saved in memory but not written to disk: <reason>; LightCraft will retry` — the change is applied in the session and
+written by the next successful save (see [control-protocol.md](control-protocol.md#when-the-library-cant-be-saved)).
+
 ## One-shot commands: `lightcraft-cli run`
 
 For agents that prefer a shell over an MCP session: run any chain of commands in one process and read one JSON
@@ -169,6 +176,7 @@ lightcraft-cli render in.dng -o out.jpg --set light.exposure=0.5 --set light.con
 lightcraft-cli render in.jpg -o out.png --settings look.json --preset <presetId>
 lightcraft-cli commands [--json]   # the command registry
 lightcraft-cli controls [--json]   # develop control ids and ranges
+lightcraft-cli calibrate --max 300 ~/Pictures/2026   # camera colour profiles (docs/camera-preview-colour.md)
 ```
 
 ## Tests

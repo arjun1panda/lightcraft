@@ -11,6 +11,33 @@ fn active_dev(s: &Session) -> lightcraft_develop::DevelopSettings {
 }
 
 #[test]
+fn changing_one_wb_control_resolves_as_shot_without_stale_tint() {
+    use lightcraft_catalog::{Photo, PhotoId, Source};
+    use lightcraft_develop::{DevelopSettings, WbMode};
+    for format in ["ARW", "NEF", "NRW", "RAF", "CR2", "PEF"] {
+        let mut s = demo();
+        let id = PhotoId(100);
+        let name = format!("synthetic.{format}");
+        let mut p = Photo::new(id, Source::File { path: name.clone() }, &name, format, 16, 16, "");
+        // A catalog made by the old generic-matrix Kelvin inference.
+        p.as_shot_wb = Some((6829.0, -127.0));
+        p.develop = std::sync::Arc::new(DevelopSettings::for_raw(6829.0, -127.0));
+        s.catalog.apply(lightcraft_catalog::Op::AddPhoto { photo: Box::new(p) }).unwrap();
+        s.execute("library.select", &json!({"ids": [100], "active": 100})).unwrap();
+        s.execute("develop.set", &json!({"control": "wb.temp", "value": 8000})).unwrap();
+        let d = active_dev(&s);
+        assert_eq!(d.wb.mode, WbMode::Custom);
+        assert_eq!(d.wb.temp, 8000.0);
+        assert_eq!(d.wb.tint, 0.0, "{format}: untouched tint comes from the current as-shot reference");
+        s.execute("develop.wb", &json!({"mode": "asShot"})).unwrap();
+        s.execute("develop.set", &json!({"control": "wb.tint", "value": 10})).unwrap();
+        assert_eq!(active_dev(&s).wb.temp, 6500.0, "{format}");
+        s.execute("develop.reset", &json!({})).unwrap();
+        assert_eq!((active_dev(&s).wb.temp, active_dev(&s).wb.tint), (6500.0, 0.0), "{format}");
+    }
+}
+
+#[test]
 fn demo_library_loads() {
     let mut s = demo();
     assert_eq!(s.visible().len(), 24);
@@ -89,6 +116,29 @@ fn albums_crud() {
     assert!(s.execute("album.delete", &json!({"id": f})).is_err(), "non-empty folder");
     s.execute("album.delete", &json!({"id": a})).unwrap();
     s.execute("album.delete", &json!({"id": f})).unwrap();
+}
+
+/// Given an album and a folder, when something is created inside each, then only the folder
+/// accepts it: the sidebar only lists children of folders, so a child of a plain album would
+/// be invisible.
+#[test]
+fn albums_and_smart_albums_are_created_only_inside_folders() {
+    let mut s = demo();
+    let folder = s.execute("album.create", &json!({"name": "Trips", "folder": true})).unwrap()["id"].as_u64().unwrap();
+    let album = s.execute("album.create", &json!({"name": "Best", "parent": folder})).unwrap()["id"].as_u64().unwrap();
+    for (cmd, params) in [
+        ("album.create", json!({"name": "Nested", "parent": album})),
+        ("album.create", json!({"name": "Nested", "folder": true, "parent": album})),
+        ("album.createSmart", json!({"name": "Nested", "parent": album})),
+        ("album.create", json!({"name": "Nested", "parent": 987_654})),
+    ] {
+        assert!(s.execute(cmd, &params).is_err(), "{cmd} {params} must be refused");
+    }
+    let n = s.catalog.albums().count();
+    let sub = s.execute("album.create", &json!({"name": "Sub", "folder": true, "parent": folder})).unwrap()["id"].as_u64().unwrap();
+    let smart = s.execute("album.createSmart", &json!({"name": "Rated", "parent": sub})).unwrap()["id"].as_u64().unwrap();
+    assert_eq!(s.catalog.albums().count(), n + 2);
+    assert_eq!(s.catalog.album(lightcraft_catalog::AlbumId(smart)).unwrap().parent, Some(lightcraft_catalog::AlbumId(sub)));
 }
 
 #[test]
@@ -356,6 +406,61 @@ fn crop_aspect_lock_current_and_toggle() {
     assert!((aw as f64 / ah as f64 - want).abs() < 0.01, "{aw}:{ah} vs {want}");
     s.execute("crop.aspect", &json!({"aspect": "toggle"})).unwrap();
     assert!(active_dev(&s).crop.aspect.is_none(), "toggle unlocks");
+}
+
+// Feature: dragging crop handles (issue 295)
+#[test]
+fn crop_drag_stops_at_the_image_edge_and_keeps_the_anchor() {
+    let mut s = demo();
+    s.execute("crop.set", &json!({"rect": [0.2, 0.2, 0.8, 0.8]})).unwrap();
+    s.execute("crop.drag", &json!({"handle": "bottomRight", "from": [0.8, 0.8], "to": [1.4, 0.7]})).unwrap();
+    let r = active_dev(&s).crop.geometry.rect;
+    assert!((r.x0 - 0.2).abs() < 1e-6 && (r.y0 - 0.2).abs() < 1e-6, "anchor moved: {r:?}");
+    assert!((r.x1 - 1.0).abs() < 1e-6 && (r.y1 - 0.7).abs() < 1e-6, "{r:?}");
+}
+
+#[test]
+fn crop_drag_keeps_a_locked_ratio_on_every_handle() {
+    let mut s = demo();
+    s.execute("crop.aspect", &json!({"aspect": "16x9"})).unwrap();
+    let d = active_dev(&s);
+    assert!(d.crop.aspect.is_some());
+    let want = d.crop.geometry.rect.aspect();
+    let r = d.crop.geometry.rect;
+    for (handle, to) in [("left", [r.x0 + 0.1, 0.5]), ("top", [0.5, r.y0 + 0.05]), ("bottomRight", [1.3, 1.3]), ("right", [0.9, 0.5])] {
+        s.execute("crop.drag", &json!({"handle": handle, "from": [0.5, 0.5], "to": to, "start": [r.x0, r.y0, r.x1, r.y1]})).unwrap();
+        let g = active_dev(&s).crop.geometry.rect;
+        assert!((g.aspect() - want).abs() < 1e-6, "{handle}: {} vs {want}", g.aspect());
+    }
+}
+
+#[test]
+fn crop_drag_rejects_unknown_handles_and_bad_points() {
+    let mut s = demo();
+    assert!(s.execute("crop.drag", &json!({"handle": "sideways", "from": [0.5, 0.5], "to": [0.6, 0.6]})).is_err());
+    assert!(s.execute("crop.drag", &json!({"handle": "move", "from": [0.5], "to": [0.6, 0.6]})).is_err());
+    assert!(s.execute("crop.drag", &json!({"handle": "move", "to": [0.6, 0.6]})).is_err());
+}
+
+#[test]
+fn crop_aspect_rejects_degenerate_custom_ratios() {
+    let mut s = demo();
+    let before = active_dev(&s).crop;
+    for bad in [json!([0.004, 3]), json!([3, 0]), json!([-1, 2]), json!([1000, 0.01]), json!(["a", 2]), json!([1, 2, 3])] {
+        assert!(s.execute("crop.aspect", &json!({"aspect": bad.clone()})).is_err(), "{bad}");
+    }
+    assert!(s.execute("crop.aspect", &json!({"aspect": "0x5"})).is_err());
+    let after = active_dev(&s).crop;
+    assert_eq!(before.geometry, after.geometry, "a rejected ratio leaves the crop alone");
+    s.execute("crop.aspect", &json!({"aspect": [2.5, 1]})).unwrap();
+    assert!(!active_dev(&s).crop.geometry.rect.is_empty());
+}
+
+#[test]
+fn crop_drag_rejects_non_numeric_points() {
+    let mut s = demo();
+    assert!(s.execute("crop.drag", &json!({"handle": "move", "from": ["a", 0.5, 0.5], "to": [0.6, 0.6]})).is_err());
+    assert!(s.execute("crop.drag", &json!({"handle": "move", "from": [0.5, 0.5], "to": [0.6, 0.6], "start": [0.1, "x", 0.5, 0.5]})).is_err());
 }
 
 #[test]
@@ -702,4 +807,170 @@ fn curve_reset_by_channel_and_whole() {
     s.execute("curve.reset", &json!({})).unwrap();
     assert_eq!(active_dev(&s).curve, lightcraft_develop::ToneCurve::default());
     assert!(s.execute("curve.reset", &json!({"channel": "alpha"})).is_err());
+}
+
+#[test]
+fn ai_masks_without_the_model_explain_themselves() {
+    let mut s = demo();
+    let id = s.active().unwrap();
+    // an Object mask that could never be computed is refused, not left empty
+    let e = s.execute("mask.add", &json!({"kind": "object"})).unwrap_err().to_string();
+    assert!(e.contains("SAM 3") || e.contains("not available"), "{e}");
+    assert!(!e.contains("invalid parameters"), "shown as is: {e}");
+    assert!(s.develop_of(id).unwrap().masks.is_empty());
+    // an empty Object component (as an older document may hold) still takes clicks
+    let shape = lightcraft_develop::MaskShape::Object { hint: vec![], exclude: vec![], seg: None, detail: vec![], edge: 0.0 };
+    let mut d = (*s.develop_of(id).unwrap()).clone();
+    d.masks.push(lightcraft_develop::Mask {
+        id: 1,
+        components: vec![lightcraft_develop::MaskComponent { name: None, op: lightcraft_develop::MaskOp::Add, invert: false, shape }],
+        ..Default::default()
+    });
+    s.set_develop(id, d, "test").unwrap();
+    s.active_mask = Some(1);
+    // clicks and descriptions need the model: an error that says what's missing, nothing changed
+    let e = s.execute("mask.objectPoint", &json!({"x": 0.5, "y": 0.5})).unwrap_err().to_string();
+    assert!(e.contains("SAM 3") || e.contains("not available"), "{e}");
+    let e = s.execute("mask.add", &json!({"kind": "prompt", "text": "sky"})).unwrap_err().to_string();
+    assert!(e.contains("SAM 3") || e.contains("not available"), "{e}");
+    let empty = std::env::temp_dir().join(format!("lc-no-sam3-{}", std::process::id()));
+    s.segmenter.dir = Some(empty.clone());
+    let e = s.execute("mask.objectPoint", &json!({"x": 0.5, "y": 0.5})).unwrap_err().to_string();
+    assert!(e.contains(&empty.display().to_string()) || e.contains("not available"), "names the folder: {e}");
+    assert_eq!(s.develop_of(id).unwrap().masks.len(), 1);
+    // bad input is an error, not a crash
+    assert!(s.execute("mask.objectPoint", &json!({"x": 1.5, "y": 0.5})).is_err());
+    assert!(s.execute("mask.add", &json!({"kind": "prompt", "text": "  "})).is_err());
+}
+
+/// A People card's close-up is a square (in pixels) inside the photo, around the face, whatever the
+/// face rectangle says: corners, oversized and degenerate rectangles never leave the frame or panic.
+#[test]
+fn face_job_crops_a_square_inside_the_photo() {
+    use lightcraft_geom::Rect;
+    let mut s = demo();
+    let id = s.active().unwrap();
+    let (w, h) = {
+        let p = s.catalog.photo(id).unwrap();
+        (f64::from(p.width), f64::from(p.height))
+    };
+    let faces = [
+        Rect { x0: 0.40, y0: 0.30, x1: 0.50, y1: 0.45 },
+        Rect { x0: 0.0, y0: 0.0, x1: 0.05, y1: 0.05 },
+        Rect { x0: 0.95, y0: 0.95, x1: 1.0, y1: 1.0 },
+        Rect { x0: -5.0, y0: -5.0, x1: 5.0, y1: 5.0 },
+        Rect { x0: 0.5, y0: 0.5, x1: 0.5, y1: 0.5 },
+        Rect { x0: f64::NAN, y0: 0.5, x1: 0.6, y1: f64::INFINITY },
+    ];
+    for face in faces {
+        let job = s.face_job(id, face, 256).expect("a job for a photo in the library");
+        let r = job.settings.crop.geometry.rect;
+        assert!((0.0..=1.0).contains(&r.x0) && (0.0..=1.0).contains(&r.y0) && r.x1 <= 1.0 + 1e-9 && r.y1 <= 1.0 + 1e-9, "{face:?} → {r:?}");
+        assert!(r.x1 > r.x0 && r.y1 > r.y0, "{face:?} → {r:?}");
+        let (pw, ph) = ((r.x1 - r.x0) * w, (r.y1 - r.y0) * h);
+        assert!((pw - ph).abs() < 1e-6 * w.max(h), "square in pixels: {face:?} → {pw} × {ph}");
+        assert_eq!(job.settings.crop.geometry.angle, 0.0);
+    }
+    // a face around (0.45, 0.375) is centred in its crop (room to spare on every side)
+    let r = s.face_job(id, faces[0], 256).unwrap().settings.crop.geometry.rect;
+    assert!((((r.x0 + r.x1) / 2.0) - 0.45).abs() < 1e-9 && (((r.y0 + r.y1) / 2.0) - 0.375).abs() < 1e-9, "{r:?}");
+    assert!(s.face_job(lightcraft_catalog::PhotoId(u64::MAX), faces[0], 256).is_none());
+}
+
+/// Regions are on the upright photo; after Rotate Right the close-up still frames the face: the box
+/// is carried into the rotated frame the crop lives in, and the crop stays square in rotated pixels.
+#[test]
+fn face_job_follows_rotate_right() {
+    use lightcraft_geom::Rect;
+    let mut s = demo();
+    let id = s.active().unwrap();
+    let (w, h) = {
+        let p = s.catalog.photo(id).unwrap();
+        (f64::from(p.width), f64::from(p.height))
+    };
+    // a small face left of centre on the upright photo
+    let face = Rect { x0: 0.30, y0: 0.45, x1: 0.35, y1: 0.50 };
+    s.execute("photo.rotateRight", &json!({})).unwrap();
+    let r = s.face_job(id, face, 256).unwrap().settings.crop.geometry.rect;
+    // a quarter turn clockwise puts the left of the photo at the top: centre (0.325, 0.475) → (0.525, 0.325)
+    assert!((((r.x0 + r.x1) / 2.0) - 0.525).abs() < 1e-9 && (((r.y0 + r.y1) / 2.0) - 0.325).abs() < 1e-9, "{r:?}");
+    // the rotated photo is h × w pixels
+    let (pw, ph) = ((r.x1 - r.x0) * h, (r.y1 - r.y0) * w);
+    assert!((pw - ph).abs() < 1e-6 * w.max(h), "square in rotated pixels: {pw} × {ph}");
+}
+
+/// Selecting an id that is not in the library is an error, and the selection stays as it was
+/// (#182: `select_photos {"ids": [9999]}` answered `selected: 1` and the session lost its photo).
+#[test]
+fn selecting_an_unknown_photo_is_an_error_and_keeps_the_selection() {
+    let mut s = demo();
+    let vis = s.visible_cloned();
+    s.execute("library.select", &json!({"ids": [vis[0].0]})).unwrap();
+    let before = s.selection.clone();
+    for p in [
+        json!({"ids": [9999]}),
+        json!({"ids": [9999], "active": 9999}),
+        json!({"ids": [vis[1].0], "active": 9999}),
+        json!({"ids": [vis[1].0, 9999]}),
+        json!({"ids": [9999], "mode": "add"}),
+        json!({"ids": [9999], "mode": "toggle"}),
+        json!({"ids": [9999], "mode": "range"}),
+    ] {
+        let e = s.execute("library.select", &p).unwrap_err().to_string();
+        assert!(e.contains("no such photo 9999"), "{p}: {e}");
+        assert_eq!(s.selection, before, "{p}");
+    }
+    assert_eq!(s.active(), Some(vis[0]));
+    assert!(s.execute("develop.get", &json!({})).is_ok());
+    // queries about an explicit id check it too
+    for c in ["develop.get", "photo.inspect", "photo.allMetadata", "history.list"] {
+        let e = s.execute(c, &json!({"id": 9999})).unwrap_err().to_string();
+        assert!(e.contains("no such photo 9999"), "{c}: {e}");
+        assert!(s.execute(c, &json!({"id": vis[1].0})).is_ok(), "{c}");
+    }
+    // an empty selection is still allowed
+    assert_eq!(s.execute("library.select", &json!({"ids": []})).unwrap()["selected"], 0);
+}
+
+/// A preset saved by another version may hold keys this one doesn't know: exporting with it keeps
+/// working (the stale keys are dropped), while a typo the caller makes is still refused (#181).
+#[test]
+fn saved_presets_with_unknown_keys_still_export() {
+    use crate::export::{ExportOptions, ExportPreset};
+    let mut s = demo();
+    s.export_presets.push(ExportPreset {
+        name: "Old".into(),
+        params: json!({"format": "png", "retiredOption": 3, "watermark": {"text": "©", "retiredKey": true}}),
+    });
+    let p = s.export_params(&json!({"preset": "old", "quality": 80})).unwrap();
+    let o = ExportOptions::from_params(&p).unwrap();
+    assert_eq!(o.format, crate::export::ExportFormat::Png);
+    assert_eq!(o.watermark.map(|w| w.text), Some("©".to_string()));
+    assert!(ExportOptions::from_params(&s.export_params(&json!({"preset": "old", "qualty": 80})).unwrap()).is_err());
+}
+
+/// Undo and redo bring the photo they change on screen (issue #293): after editing one photo and
+/// moving on, Undo makes it the active photo again; a step that changes several photos leaves the
+/// selection alone.
+#[test]
+fn undo_and_redo_show_the_photo_they_change() {
+    let mut s = demo();
+    let vis = s.visible_cloned();
+    let (a, b) = (vis[0], vis[1]);
+    s.execute("library.select", &json!({"ids": [a.0]})).unwrap();
+    s.execute("develop.set", &json!({"control": "light.exposure", "value": 1.0})).unwrap();
+    s.execute("library.select", &json!({"ids": [b.0]})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.active(), Some(a), "undo shows the photo it changed");
+    assert_eq!(s.selection.ids, vec![a]);
+    s.execute("library.select", &json!({"ids": [b.0]})).unwrap();
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(s.active(), Some(a), "so does redo");
+    // rating both selected photos is one step over two photos: undoing it leaves the selection
+    s.execute("library.select", &json!({"ids": [a.0, b.0], "active": b.0})).unwrap();
+    s.execute("photo.rate", &json!({"rating": 3})).unwrap();
+    s.execute("library.select", &json!({"ids": [a.0, b.0], "active": a.0})).unwrap();
+    let before = s.selection.clone();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.selection, before, "a step over several photos keeps the selection");
 }

@@ -10,36 +10,61 @@
 //! run them off the UI thread.
 #![forbid(unsafe_code)]
 
+// Model/cache types remain available without linking the optional inference crate.
+#[cfg(not(feature = "denoise"))]
+extern crate lightcraft_denoise_core as lightcraft_denoise;
+
+pub mod availability;
+mod camera_preview;
+pub mod camera_profiles;
 pub mod cmd;
+pub mod config;
 pub mod crs;
 pub mod crs_masks;
 pub mod demo;
+pub mod denoise;
 pub mod devices;
 pub mod export;
+pub mod face_download;
+#[cfg(not(target_arch = "wasm32"))]
+mod faces_index;
+#[cfg(not(target_arch = "wasm32"))]
+mod faces_worker;
 pub mod files;
+pub mod fonts;
 pub mod guard;
 pub mod import;
 mod import_move;
 pub mod library;
+mod lightroom_archive;
+pub mod lightroom_catalog;
+pub mod lightroom_job;
+mod lightroom_sqlite;
+pub mod logging;
 pub mod media;
 pub mod memory;
 pub mod merge;
+mod model_download;
+pub mod originals;
 pub mod preset_import;
 pub mod preset_luminar;
 pub mod presets;
 pub mod rename;
+pub mod segment;
 pub mod sidecar;
 pub mod smart;
 mod view;
+pub mod walk;
 
 use std::sync::Arc;
 
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
+pub use fonts::{CRAFT_FONTS, CraftFont};
 use lightcraft_catalog::{Catalog, Filter, Op, PhotoId, Sort};
 use lightcraft_develop::DevelopSettings;
 pub use media::{RenderJob, SourceLevel};
 use serde_json::Value;
-pub use view::{Browse, FilterChip, LibrarySource, Selection, filter_chips};
+pub use view::{Browse, FilterChip, LibrarySource, Selection, SelectionState, filter_chips};
 pub use {lightcraft_catalog as catalog, lightcraft_develop as develop, lightcraft_gpu as gpu, lightcraft_pipeline as pipeline};
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +77,13 @@ pub enum EngineError {
     BadParams { cmd: String, msg: String },
     #[error("{0}")]
     Catalog(#[from] lightcraft_catalog::CatalogError),
+    /// The command's change is applied (in memory, undoable) but its journal records could not
+    /// be written. They stay queued and are written by the next successful save.
+    #[error("saved in memory but not written to disk: {0}; LightCraft will retry")]
+    NotSaved(String),
+    /// Another process (the app, `lightcraft-cli`, another computer) has the library open.
+    #[error("{0}")]
+    LibraryInUse(String),
     #[error("{0}")]
     Other(String),
 }
@@ -63,6 +95,43 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub struct UndoEntry {
     pub label: String,
     pub op: Op,
+    /// A folder to rename on disk (`from` → `to`) before `op` is applied: Rename / Move Folder
+    /// (whose `op` relinks the photos inside). Never overwrites; refused when `to` exists.
+    pub folder: Option<FolderMove>,
+}
+
+/// The one photo an undo step changes, when it changes exactly one through its edit, rating, flag,
+/// label, metadata or versions (`depth` bounds nested batches).
+fn single_photo(op: &Op, depth: usize) -> Option<PhotoId> {
+    match op {
+        Op::SetDevelop { id, .. }
+        | Op::SetRating { id, .. }
+        | Op::SetFlag { id, .. }
+        | Op::SetLabel { id, .. }
+        | Op::SetMeta { id, .. }
+        | Op::SetVersions { id, .. }
+        | Op::SetHistory { id, .. }
+        | Op::PushHistory { id, .. } => Some(*id),
+        Op::Batch { ops } if depth < 8 => {
+            let mut ids = ops.iter().map(|o| single_photo(o, depth + 1));
+            let first = ids.next()??;
+            ids.all(|id| id == Some(first)).then_some(first)
+        }
+        _ => None,
+    }
+}
+
+/// A folder renamed or moved on disk as part of an undo step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderMove {
+    pub from: String,
+    pub to: String,
+}
+
+impl FolderMove {
+    fn reversed(&self) -> Self {
+        Self { from: self.to.clone(), to: self.from.clone() }
+    }
 }
 
 /// An in-progress slider drag / brush stroke: one undo step when it ends.
@@ -75,8 +144,10 @@ pub struct Interaction {
 
 /// Source of [`Session::visible_shared`] generations (process-wide, so two sessions never share one).
 static VISIBLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static LIBRARY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub struct Session {
+    library_generation: u64,
     /// Auto Sync: edits to the active photo also change the other selected photos (the settings
     /// that changed, nothing else).
     pub auto_sync: bool,
@@ -97,10 +168,27 @@ pub struct Session {
     pub undo: Vec<UndoEntry>,
     pub redo: Vec<UndoEntry>,
     pub interaction: Option<Interaction>,
+    /// Set by a command whose change must not rewrite the photo's XMP sidecar even with auto-write on
+    /// (a catalog-only edit of data the sidecar writer does not emit); consumed when the command ends.
+    pub(crate) skip_auto_write: bool,
+    /// AI denoise: the model in use, the photos that have their picture and the work in progress.
+    pub(crate) denoise: denoise::State,
+    /// Where the host keeps face models (one folder each); `None` where there is no file system (the web).
+    pub face_models_dir: Option<std::path::PathBuf>,
+    /// Face model downloads started this session (the staged files wait in `<face_models_dir>/.downloads`).
+    pub face_downloads: face_download::Downloads,
+    /// The user's own list of models to download (`catalog.json` in the models folder), as last read.
+    pub(crate) face_catalog: lightcraft_faces::catalog::Catalog,
+    /// The loaded recognition model and the face embeddings made with it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) faces: faces_index::FacesState,
     /// Copied develop settings (partial JSON) for Paste.
     pub clipboard: Option<Value>,
     /// The folder on disk the [`LibrarySource::Folder`] view browses.
     pub browse: Option<Browse>,
+    /// The folder the [`LibrarySource::LibraryFolder`] view shows: the library's photos imported
+    /// from it and from the folders inside it.
+    pub library_folder: Option<String>,
     /// Copied metadata (`photo.copyMetadata`): photo.setMeta params.
     pub meta_clipboard: Option<Value>,
     /// The photo that was active before the current one (Paste Settings from Previous).
@@ -122,10 +210,14 @@ pub struct Session {
     depth: u32,
     /// Selected mask (Masking panel), by mask id.
     pub active_mask: Option<u32>,
+    /// AI masks (SAM 3): the model and the last photo prepared for it.
+    pub segmenter: segment::Segmenter,
     /// Selected spot (Remove panel), by index into the active photo's spots.
     pub active_spot: Option<usize>,
     /// The persistent library this session writes to (`None` = in-memory only).
     pub library: Option<library::Library>,
+    /// Identity of current library opening; refreshed only after a successful open.
+    pub(crate) library_identity: Arc<()>,
     /// XMP sidecar preferences (persisted with the library).
     pub xmp: sidecar::XmpPrefs,
     /// Parameters of the last export (`app.export` params, minus targets), persisted in prefs.json.
@@ -168,6 +260,9 @@ pub struct Session {
     pub cache_mb: u32,
     /// Where smart previews are kept when not in the library folder (persisted in prefs.json).
     pub smart_previews_dir: Option<std::path::PathBuf>,
+    /// Untouched Local records of folders not browsed for this many days are forgotten when the
+    /// library opens (0 = never; persisted in prefs.json). See `cmd/browse.rs`.
+    pub forget_local_days: u32,
 }
 
 impl Default for Session {
@@ -177,8 +272,13 @@ impl Default for Session {
 }
 
 impl Session {
+    pub fn library_generation(&self) -> u64 {
+        self.library_generation
+    }
+
     pub fn new() -> Session {
         Session {
+            library_generation: LIBRARY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             auto_sync: false,
             catalog: Catalog::new(),
             source: LibrarySource::All,
@@ -192,9 +292,17 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             interaction: None,
+            skip_auto_write: false,
+            denoise: Default::default(),
+            face_models_dir: None,
+            face_downloads: Default::default(),
+            face_catalog: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            faces: Default::default(),
             clipboard: None,
             meta_clipboard: None,
             browse: None,
+            library_folder: None,
             previous_active: None,
             copy_groups: lightcraft_develop::SettingsGroup::default_copy(),
             presets: presets::builtin(),
@@ -206,8 +314,10 @@ impl Session {
             clock: Box::new(|| "2026-09-30T12:00:00".to_string()),
             depth: 0,
             active_mask: None,
+            segmenter: segment::Segmenter::default(),
             active_spot: None,
             library: None,
+            library_identity: Arc::new(()),
             xmp: sidecar::XmpPrefs::default(),
             last_export: None,
             export_presets: Vec::new(),
@@ -228,6 +338,7 @@ impl Session {
             import_defaults: import::ImportDefaults::default(),
             cache_mb: 0,
             smart_previews_dir: None,
+            forget_local_days: lightcraft_catalog::DEFAULT_FORGET_DAYS,
         }
     }
 
@@ -244,11 +355,22 @@ impl Session {
         (spec.enabled)(self).map_err(|why| EngineError::Disabled(id.to_string(), why))?;
         let empty = Value::Object(Default::default());
         let params = if params.is_null() { &empty } else { params };
+        self.run_command(id, spec.journal.then_some(params), |s| (spec.run)(s, params))
+    }
+
+    /// Run `f` as command `id` with what [`Session::execute`] does around every command: the
+    /// panic guard, auto versions, XMP sidecar auto-write and the durable save (a failed save is
+    /// `NotSaved`). Not journaled. The app's import task commits its batches this way.
+    pub fn execute_fn(&mut self, id: &str, f: impl FnOnce(&mut Session) -> Result<Value>) -> Result<Value> {
+        self.run_command(id, None, f)
+    }
+
+    fn run_command(&mut self, id: &str, journal: Option<&Value>, f: impl FnOnce(&mut Session) -> Result<Value>) -> Result<Value> {
         let log_start = self.pending_log.len();
         let was_active = self.active();
         self.depth += 1;
         // last-resort guard: a panic in a command is that command's error, not a crash
-        let r = guard::catch(&format!("`{id}`"), || (spec.run)(self, params)).unwrap_or_else(|e| Err(EngineError::Other(e)));
+        let r = guard::catch(&format!("`{id}`"), || f(self)).unwrap_or_else(|e| Err(EngineError::Other(e)));
         self.depth -= 1;
         if self.depth == 0 && was_active.is_some() && self.active() != was_active {
             self.previous_active = was_active;
@@ -256,19 +378,34 @@ impl Session {
                 self.auto_version(left);
             }
         }
-        if r.is_ok() && spec.journal && self.depth == 0 {
+        if r.is_ok()
+            && let Some(params) = journal
+            && self.depth == 0
+        {
             self.journal.push((id.to_string(), params.clone()));
             if self.journal.len() > 10_000 {
                 self.journal.drain(..1000);
             }
         }
-        if r.is_ok() && self.depth == 0 && self.xmp.auto_write && self.interaction.is_none() && self.pending_log.len() > log_start {
-            self.auto_write_sidecars(&self.pending_log[log_start..]);
+        if self.depth == 0 {
+            let skip = std::mem::take(&mut self.skip_auto_write);
+            if r.is_ok() && !skip && self.xmp.auto_write && self.interaction.is_none() && self.pending_log.len() > log_start {
+                self.auto_write_sidecars(&self.pending_log[log_start..]);
+            }
         }
         if self.depth == 0 && self.library.is_some() {
-            // Make the command durable before reporting success (on failure the ops stay pending,
-            // are retried after the next command, and `library.info` reports the error).
-            let _ = self.persist();
+            // Make the command durable before reporting success. When the command's own records
+            // can't be appended, it fails with `NotSaved`: the change stays applied in memory and
+            // queued, and the next save (any later command, or the frame loop) retries it. Other
+            // persistence trouble (a failed compaction, an older queued change still unwritten by
+            // a command that changed nothing) doesn't fail the command; `library.info` reports it.
+            let produced = self.pending_log.len() > log_start;
+            if let Err(e @ EngineError::NotSaved(_)) = self.persist()
+                && produced
+                && r.is_ok()
+            {
+                return Err(e);
+            }
         }
         r
     }
@@ -284,11 +421,42 @@ impl Session {
         let fwd = op.clone();
         let inv = self.catalog.apply(op)?;
         self.pending_log.push(fwd);
-        self.undo.push(UndoEntry { label: label.to_string(), op: inv });
+        self.undo.push(UndoEntry { label: label.to_string(), op: inv, folder: None });
         if self.undo.len() > 1000 {
             self.undo.remove(0);
         }
         self.redo.clear();
+        Ok(())
+    }
+
+    /// [`Session::commit`] for an op that goes with a folder already renamed on disk; the undo
+    /// step renames it back (`folder` is the undo direction: current place → old place).
+    pub(crate) fn commit_with_folder(&mut self, label: &str, op: Op, folder: FolderMove) -> Result<()> {
+        self.commit(label, op)?;
+        if let Some(e) = self.undo.last_mut() {
+            e.folder = Some(folder);
+        }
+        Ok(())
+    }
+
+    /// The box to cut a face's picture from: the detector's, when the scan has looked at the face (every face is then shown
+    /// equally close, however loosely or tightly its own region was drawn), else the region's own box.
+    pub fn face_view(&self, id: PhotoId, rect: lightcraft_geom::Rect) -> lightcraft_geom::Rect {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(v) = self.faces.index.view(id.0, &rect) {
+            return v;
+        }
+        let _ = id;
+        rect
+    }
+
+    /// Apply an op that is LightCraft's own bookkeeping rather than something the user did (faces found by the background
+    /// scan): journaled like any op, but not an undo step, and it leaves the redo stack alone.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn apply_system(&mut self, op: Op) -> Result<()> {
+        let fwd = op.clone();
+        self.catalog.apply(op)?;
+        self.pending_log.push(fwd);
         Ok(())
     }
 
@@ -322,9 +490,13 @@ impl Session {
         if n < 2 || n > self.undo.len() {
             return;
         }
+        // a step that moves a folder on disk stays on its own
+        if self.undo[self.undo.len() - n..].iter().any(|e| e.folder.is_some()) {
+            return;
+        }
         let tail = self.undo.split_off(self.undo.len() - n);
         let ops = tail.into_iter().rev().map(|e| e.op).collect();
-        self.undo.push(UndoEntry { label: label.to_string(), op: Op::Batch { ops } });
+        self.undo.push(UndoEntry { label: label.to_string(), op: Op::Batch { ops }, folder: None });
     }
 
     /// Apply without recording undo (interactive previews).
@@ -335,41 +507,86 @@ impl Session {
 
     pub fn undo_step(&mut self) -> Result<String> {
         let e = self.undo.pop().ok_or_else(|| EngineError::Other("nothing to undo".into()))?;
-        let redo = match self.apply_with_files(&e.op) {
+        let redo = match self.apply_with_files(&e.op, e.folder.as_ref()) {
             Ok(r) => r,
             Err(err) => {
                 self.undo.push(e);
                 return Err(err);
             }
         };
+        self.show_undone(&e.op);
         self.pending_log.push(e.op);
-        self.redo.push(UndoEntry { label: e.label.clone(), op: redo });
+        self.redo.push(UndoEntry { label: e.label.clone(), op: redo, folder: e.folder.as_ref().map(FolderMove::reversed) });
         Ok(e.label)
     }
 
     pub fn redo_step(&mut self) -> Result<String> {
         let e = self.redo.pop().ok_or_else(|| EngineError::Other("nothing to redo".into()))?;
-        let undo = match self.apply_with_files(&e.op) {
+        let undo = match self.apply_with_files(&e.op, e.folder.as_ref()) {
             Ok(r) => r,
             Err(err) => {
                 self.redo.push(e);
                 return Err(err);
             }
         };
+        self.show_undone(&e.op);
         self.pending_log.push(e.op);
-        self.undo.push(UndoEntry { label: e.label.clone(), op: undo });
+        self.undo.push(UndoEntry { label: e.label.clone(), op: undo, folder: e.folder.as_ref().map(FolderMove::reversed) });
         Ok(e.label)
     }
 
-    /// Apply an undo/redo op, first moving the files its renames imply (all or nothing).
-    fn apply_with_files(&mut self, op: &Op) -> Result<Op> {
+    /// After an undo or redo that changed one photo (its edit, rating, flag, label, metadata or
+    /// versions), that photo becomes the active one, as in Lightroom Classic, so the change is on
+    /// screen (issue #293). It joins the selection if it isn't in it; nothing changes for steps
+    /// that touch several photos, albums or files, or for a photo not in the current view.
+    fn show_undone(&mut self, op: &Op) {
+        let Some(id) = single_photo(op, 0) else { return };
+        if self.selection.active == Some(id) || !self.visible().contains(&id) {
+            return;
+        }
+        if !self.selection.contains(id) {
+            self.selection = Selection { ids: vec![id], active: Some(id) };
+        } else {
+            self.selection.active = Some(id);
+        }
+        self.active_mask = None;
+        self.active_spot = None;
+    }
+
+    /// Apply an undo/redo op, first renaming the step's folder and moving the files its renames
+    /// imply (all or nothing). Files that can't be moved back after a failure are reported and the
+    /// library follows them (a logged change outside the undo history), so none goes missing; the
+    /// folder is only moved back when no file was left behind at its new path.
+    fn apply_with_files(&mut self, op: &Op, folder: Option<&FolderMove>) -> Result<Op> {
+        let fs = rename::RealFs;
+        if let Some(f) = folder {
+            cmd::browse::rename_folder_on_disk(&f.from, &f.to).map_err(|e| EngineError::Other(format!("can't move the folder back: {e}")))?;
+        }
+        let undo_folder = || {
+            if let Some(f) = folder {
+                let _ = cmd::browse::rename_folder_on_disk(&f.to, &f.from);
+            }
+        };
         let moves = self.file_moves(op);
-        Session::move_files(&moves)?;
+        if let Err(e) = rename::move_all(&fs, &moves) {
+            if e.stuck.is_empty() {
+                undo_folder();
+            }
+            return Err(EngineError::Other(format!("can't move the files back: {}", self.follow_stuck(op, e, false))));
+        }
         match self.catalog.apply(op.clone()) {
-            Ok(inv) => Ok(inv),
+            Ok(inv) => {
+                if let Some(f) = folder {
+                    cmd::browse::follow_folder(self, &f.from, &f.to);
+                }
+                Ok(inv)
+            }
             Err(e) => {
                 let back: Vec<(String, String)> = moves.iter().rev().map(|(a, b)| (b.clone(), a.clone())).collect();
-                let _ = Session::move_files(&back);
+                if let Err(be) = rename::move_all(&fs, &back) {
+                    return Err(EngineError::Other(format!("{e}; the files could not all be moved back: {}", be.message)));
+                }
+                undo_folder();
                 Err(e.into())
             }
         }
@@ -484,7 +701,12 @@ impl Session {
 
     /// Photos shown in the grid/filmstrip for the current source, filter and sort.
     pub fn visible(&mut self) -> &[PhotoId] {
-        let key = (self.catalog.revision, format!("{:?}|{:?}|{:?}|{:?}", self.source, self.filter, self.sort, self.browse));
+        let mut key =
+            (self.catalog.revision, format!("{:?}|{:?}|{:?}|{:?}|{:?}", self.source, self.filter, self.sort, self.browse, self.library_folder));
+        if self.source == LibrarySource::Missing && self.media.availability.is_background() {
+            // the view fills in as the background checks find files gone
+            key.1.push_str(&format!("|{}", self.media.availability.generation()));
+        }
         if self.visible_key.as_ref() != Some(&key) {
             // "in the last N days" rules count back from the session's clock
             lightcraft_catalog::rules::set_now(Some((self.clock)()));
@@ -495,7 +717,18 @@ impl Session {
                 f.folder = Some(b.path);
                 f.subfolders = b.subfolders;
             }
+            if self.source == LibrarySource::LibraryFolder {
+                // no folder chosen: nothing (`.` names no folder)
+                f.library_folder = Some(self.library_folder.clone().unwrap_or_else(|| ".".into()));
+            }
             let mut visible = self.catalog.query(&f, &self.sort);
+            if visible.is_empty() && self.source == LibrarySource::LibraryFolder && !self.folder_holds_photos() {
+                // the shown folder lost its last photo (deleted, moved, removed): everything, not
+                // an empty grid under the name of a folder that is gone from the sidebar
+                self.source = LibrarySource::All;
+                self.library_folder = None;
+                return self.visible();
+            }
             if matches!(self.source, LibrarySource::Album(_))
                 && self.sort.key == lightcraft_catalog::SortKey::CaptureDate
                 && let LibrarySource::Album(a) = self.source
@@ -519,8 +752,8 @@ impl Session {
             }
             if self.source == LibrarySource::Missing {
                 // only the photos the query kept (library photos, not Local browse records) are checked
-                let cat = &self.catalog;
-                visible.retain(|id| cmd::missing::is_missing(cat, *id));
+                let (cat, avail) = (&self.catalog, &self.media.availability);
+                visible.retain(|id| cmd::missing::is_missing(cat, avail, *id));
             }
             if self.source != LibrarySource::RecentlyDeleted {
                 visible = self.catalog.arrange_stacks(&visible);
@@ -532,19 +765,29 @@ impl Session {
         &self.visible
     }
 
+    /// Whether the library still holds a photo imported from the folder a `LibraryFolder` source
+    /// shows.
+    fn folder_holds_photos(&self) -> bool {
+        let f = Filter { library_folder: self.library_folder.clone(), ..Default::default() };
+        self.library_folder.is_some() && !self.catalog.query(&f, &Sort::default()).is_empty()
+    }
+
     /// Photos in the current source (folder, album, …) before the filter bar and search narrow
     /// them; `None` where that is not a separate number (Missing Photos).
     pub fn source_total(&mut self) -> Option<usize> {
         if self.source == LibrarySource::Missing {
             return None;
         }
-        let key = (self.catalog.revision, format!("{:?}|{:?}", self.source, self.browse));
+        let key = (self.catalog.revision, format!("{:?}|{:?}|{:?}", self.source, self.browse, self.library_folder));
         if self.total.as_ref().map(|t| &t.0) != Some(&key) {
             let mut f = self.source.to_filter(&Filter::default(), &self.catalog);
             if self.source == LibrarySource::Folder {
                 let b = self.browse.clone().unwrap_or_default();
                 f.folder = Some(b.path);
                 f.subfolders = b.subfolders;
+            }
+            if self.source == LibrarySource::LibraryFolder {
+                f.library_folder = Some(self.library_folder.clone().unwrap_or_else(|| ".".into()));
             }
             let n = self.catalog.query(&f, &self.sort).len();
             self.total = Some((key, n));
@@ -595,9 +838,22 @@ pub fn json_delta(old: &Value, new: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_album_order;
+#[cfg(test)]
 mod tests_color;
 #[cfg(test)]
+mod tests_denoise;
+#[cfg(test)]
 mod tests_export;
+#[cfg(test)]
+mod tests_face_models;
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests_face_recognize;
+#[cfg(test)]
+mod tests_folders;
+#[cfg(test)]
+mod tests_forget_local;
 #[cfg(test)]
 mod tests_import;
 #[cfg(test)]
@@ -611,7 +867,13 @@ mod tests_merge;
 #[cfg(test)]
 mod tests_organize;
 #[cfg(test)]
+mod tests_persist;
+#[cfg(test)]
 mod tests_prefs;
+#[cfg(test)]
+mod tests_segment;
+#[cfg(test)]
+mod tests_settings_files;
 #[cfg(test)]
 mod tests_spots;
 #[cfg(test)]
