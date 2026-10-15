@@ -252,13 +252,11 @@ fn parse_tree(s: &str) -> Result<Node, XmpError> {
                     stack.push(node);
                 }
             }
-            Event::End(_) => {
-                if stack.len() > 1 {
-                    let n = stack.pop().expect("len > 1");
-                    scopes.pop();
-                    if let Some(parent) = stack.last_mut() {
-                        parent.children.push(n);
-                    }
+            Event::End(_) if stack.len() > 1 => {
+                let n = stack.pop().expect("len > 1");
+                scopes.pop();
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(n);
                 }
             }
             Event::Text(t) => {
@@ -418,7 +416,7 @@ fn parse_one_region(item: &XmpValue, px_dims: Option<(f64, f64)>) -> Option<Regi
     // frame and writes the orientation as the region's `mwg-rs:Rotation` (π for 3, −π/2 for 6, +π/2 for
     // 8; 0 for 1) while `AppliedToDimensions` names the upright size. Turn it into the upright frame.
     // MWG has no way to say "mirrored", so orientations 2/4/5/7 can't be told apart from their unmirrored
-    // twins here; boxes on mirrored photos are taken as written (see LR-LIB-PEOPLE in docs/parity.md).
+    // twins here; boxes on mirrored photos are taken as written (see LR-LIB-PEOPLE in docs/parity-checklist.md).
     let rotation = item.field("mwg-rs:Rotation").and_then(XmpValue::text).and_then(parse_number).filter(|r| r.is_finite());
     let (quarter, half) = (std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
     let (cx, cy, w, h) = match rotation {
@@ -686,6 +684,7 @@ mod tests {
             // write_xmp doesn't emit regions yet (read-only interchange; see docs/xmp-interop.md), so the
             // roundtrip fixture must leave this empty or `roundtrip_all_fields` can't round-trip it.
             regions: Vec::new(),
+            focus: None,
             make: Some("Maker & Sons".into()),
             model: Some("X <1>".into()),
             serial_number: Some("SN1".into()),

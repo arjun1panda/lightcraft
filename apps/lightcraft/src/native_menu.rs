@@ -26,8 +26,9 @@ const QUIT: &str = "app.quit";
 const SETTINGS: &str = "app.settings";
 const SETTINGS_KEY: &str = "Cmd+,";
 /// Keys whose meaning depends on the panel (X = reject or swap crop aspect, ⌫ = delete the photo
-/// or the active mask): left to the egui handler, which knows the context.
-const CONTEXTUAL: &[&str] = &["X", "Delete"];
+/// or the active mask; ⌘↑/⌘↓ flag status follows Compare/Survey's active photo): left to the egui
+/// handler, which knows the context.
+const CONTEXTUAL: &[&str] = &["X", "Delete", "Cmd+Up", "Cmd+Down"];
 /// Shortcuts text fields need while they have focus.
 const TEXT_EDIT: &[&str] = &["Cmd+A", "Cmd+C", "Cmd+V", "Cmd+X", "Cmd+Z", "Cmd+Shift+Z"];
 
@@ -126,6 +127,7 @@ fn accelerator(sc: &str) -> Option<Accelerator> {
         "=" => Code::Equal,
         "-" => Code::Minus,
         "'" => Code::Quote,
+        "`" => Code::Backquote,
         "," => Code::Comma,
         "Delete" => Code::Backspace,
         // with modifiers only: a bare Enter belongs to text fields and tools
@@ -355,12 +357,15 @@ impl NativeMenu {
     }
 
     /// Per frame: run chosen items, then sync labels / enabled / checked and the text-focus
-    /// accelerators with the app state.
-    pub fn update(&mut self, app: &mut LightcraftApp, ctx: &egui::Context) {
+    /// accelerators with the app state. Returns whether Quit was chosen: the caller saves
+    /// everything and exits the process itself (closing the viewport while AppKit terminates the
+    /// app can crash in winit's teardown, PR #444).
+    pub fn update(&mut self, app: &mut LightcraftApp, ctx: &egui::Context) -> bool {
         lightcraft_ui_egui::i18n::set_language(app.ui.language);
+        let mut quit = false;
         while let Ok(key) = self.rx.try_recv() {
             if key == QUIT {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                quit = true;
                 continue;
             }
             if key == "app.about" || key == SETTINGS {
@@ -375,7 +380,7 @@ impl NativeMenu {
         let bar = menu_bar(app);
         if structure_of(&bar) != self.structure {
             self.rebuild(app);
-            return;
+            return quit;
         }
         fn walk(nodes: &[MenuNode], items: &mut HashMap<String, Item>) {
             for n in nodes {
@@ -429,6 +434,7 @@ impl NativeMenu {
             }
             self.publish_shortcuts(app);
         }
+        quit
     }
 }
 
